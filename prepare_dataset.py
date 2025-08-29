@@ -35,7 +35,6 @@ def _parse_bool(val: Optional[str], default: bool) -> bool:
 
 
 def main(argv: Optional[List[str]] = None) -> None:
-    # Defaults matching current behavior
     default_base_path = rf".\Dataset\\"
     default_model_name = getattr(loss_engine, "MODEL_NAME", rf".\Models\slm2-stage2")
 
@@ -46,6 +45,7 @@ def main(argv: Optional[List[str]] = None) -> None:
     parser.add_argument("--with_synthetic", type=str, default="true", help="Include synthetic data (true/false)")
     parser.add_argument("--with_loss", type=str, default="true", help="Compute loss metrics (true/false)")
     parser.add_argument("--model_name", type=str, default=default_model_name, help="HF model path/name for loss engine (default: current in loss_engine)")
+    parser.add_argument("--clean", type=str, default="false", help="Clean output directory before processing (true/false)")
 
     args = parser.parse_args(argv)
 
@@ -53,11 +53,18 @@ def main(argv: Optional[List[str]] = None) -> None:
     out_root = args.out_path if args.out_path else os.path.join(base_path, "Prepared")
     ensure_dirs(out_root)
 
+    if _parse_bool(args.clean, False):
+        print(f"Cleaning output directory: {out_root}")
+        for root, dirs, files in os.walk(out_root, topdown=False):
+            for name in files:
+                os.remove(os.path.join(root, name))
+            for name in dirs:
+                os.rmdir(os.path.join(root, name))
+
     with_chats = _parse_bool(args.with_chats, True)
     with_synthetic = _parse_bool(args.with_synthetic, True)
     with_loss = _parse_bool(args.with_loss, True)
 
-    # Allow overriding the loss model used by the loss engine
     try:
         if isinstance(args.model_name, str) and args.model_name:
             loss_engine.MODEL_NAME = args.model_name
