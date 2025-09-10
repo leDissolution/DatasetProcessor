@@ -673,3 +673,32 @@ __all__ = [
     "compute_losses_for_datapoints",
     "benchmark_max_tokens_per_batch",
 ]
+
+# --- Device utilities ---
+from typing import Sequence  # placed late to avoid clutter
+
+def validate_devices(devices: Optional[Sequence[int]]) -> List[int]:
+    """Return the subset of requested device indices that are actually available.
+
+    If devices is None, returns the module default DEVICES filtered for availability.
+    Prints warnings (never raises) if some requested devices are missing or CUDA not available.
+    """
+    if devices is None:
+        devices = DEVICES
+    try:
+        import torch  # local import; may fail in CPU-only env
+        if not torch.cuda.is_available():
+            if len(devices) > 0:
+                print("[DEVICES] Warning: CUDA not available; using no GPU devices.")
+            return []
+        count = torch.cuda.device_count()
+        avail = [d for d in devices if isinstance(d, int) and 0 <= d < count]
+        missing = [d for d in devices if d not in avail]
+        if missing:
+            print(f"[DEVICES] Warning: requested device(s) {missing} not present. Available: {list(range(count))}. Using subset {avail}.")
+        return avail
+    except Exception as e:  # pragma: no cover - very rare path
+        print(f"[DEVICES] Warning: device validation failed ({e}); using requested list as-is.")
+        return list(devices)
+
+__all__.append("validate_devices")

@@ -4,12 +4,8 @@ import random
 from typing import Optional, List, Dict, Any, Tuple
 from entity_parser import parse_text
 from datapoint import Datapoint, LossMetrics
-from loss_engine import compute_losses_for_datapoints
-try:
-    from pipeline import run_pipeline, PipelineContext
-except Exception:
-    run_pipeline = None
-    PipelineContext = object
+from loss_engine import compute_losses_for_datapoints, validate_devices
+from pipeline import run_pipeline, PipelineContext
 from processing_cache import (
     ProcessingCache,
     compute_file_hash,
@@ -18,7 +14,6 @@ from processing_cache import (
     remap_cached_entries_source,
 )
 from Entities.registry import default_registry
-from types import SimpleNamespace
 
 def ingest_entities(
     path: str,
@@ -26,7 +21,8 @@ def ingest_entities(
     with_loss: bool = True,
     with_json: bool = False,
     batch_size: int = 35,
-    tok_per_batch: int = 26624,
+    tok_per_batch: int = 10000,
+    devices: Optional[List[int]] = None,
     pipeline_passes: Optional[list] = None,
     pipeline_ctx: Optional[object] = None,
     # Cache behavior controls:
@@ -49,21 +45,16 @@ def ingest_entities(
         print(f"Error: Input file {path} not found.")
         return
 
-    # Determine cache behavior (defaults + env overrides + explicit args)
     env_force = str(os.environ.get("STATSUITE_FORCE_REPROCESS", "")).strip().lower() in {"1", "true", "yes", "y"}
     env_skip_read = str(os.environ.get("STATSUITE_SKIP_CACHE_READ", "")).strip().lower() in {"1", "true", "yes", "y"}
     env_disable_write = str(os.environ.get("STATSUITE_DISABLE_CACHE_WRITE", "")).strip().lower() in {"1", "true", "yes", "y"}
     env_skip_file_read = str(os.environ.get("STATSUITE_SKIP_FILE_CACHE_READ", "")).strip().lower() in {"1", "true", "yes", "y"}
 
     if cache_read is None:
-        # If forcing reprocess or skip-read is set, don't read from cache; otherwise read.
         cache_read = not (env_force or env_skip_read)
     if cache_write is None:
-        # Default to writing; allow disabling via env.
         cache_write = not env_disable_write
-    # Allow overriding file-level cache read independently; default to same as cache_read
     if file_cache_read is None:
-        # Respect dedicated file-cache skip if set; otherwise mirror dp-level read flag
         file_cache_read = (cache_read is True) and (not env_skip_file_read) or (cache_read is False and False) or (cache_read is None and (not env_skip_file_read))
 
     cache = ProcessingCache()
@@ -88,7 +79,6 @@ def ingest_entities(
                 cache.close()
             return
         else:
-            # Avoid sticky state where an empty file-level cache prevents reprocessing
             try:
                 print(f"[CACHE] Ignoring empty full-file cache for '{path}'; will reprocess.")
             except Exception:
@@ -122,7 +112,6 @@ def ingest_entities(
         pass
 
     new_slices: Dict[int, List[Dict[str, Any]]] = {}
-    # Track success/failure to avoid writing bad empty caches
     total_outs = 0
     total_success = 0
     if misses:
@@ -132,7 +121,7 @@ def ingest_entities(
                 rng_seed = int(dp_key[:8], 16)
                 base_registry = getattr(pipeline_ctx, "registry", default_registry()) if pipeline_ctx else default_registry()
                 split_val = getattr(pipeline_ctx, "split", None) if pipeline_ctx else None
-                ctx_local = SimpleNamespace(rng=random.Random(rng_seed), registry=base_registry, split=split_val)
+                ctx_local = PipelineContext(rng=random.Random(rng_seed), registry=base_registry, split=split_val)
                 try:
                     outs = run_pipeline([dp], pipeline_passes, ctx=ctx_local)  # type: ignore[arg-type]
                 except Exception as e:
@@ -148,24 +137,30 @@ def ingest_entities(
             for out_dp in outs:
                 flat_dps.append((idx, dp_key, out_dp))
 
-        # Fault-tolerant loss computation: isolate failing datapoints and skip caching them
         if with_loss and flat_dps:
+            devices_filtered: Optional[List[int]] = validate_devices(devices) if devices is not None else None
+            if devices is not None and devices_filtered == []:
+                raise RuntimeError("All requested GPU devices are unavailable; aborting loss computation.")
             def compute_metrics_safe(dps: List[Datapoint], tpb: int) -> List[Optional[Dict[str, Any]]]:
-                # Returns list of metrics dict or None on failure per dp
                 if not dps:
                     return []
                 try:
-                    res = compute_losses_for_datapoints(dps, batch_size=batch_size, debug_print=debug, debug_samples=batch_size, max_tokens_per_batch=tpb)
+                    kwargs: Dict[str, Any] = {}
+                    if devices_filtered:
+                        kwargs["devices"] = devices_filtered
+                    res = compute_losses_for_datapoints(dps, batch_size=batch_size, debug_print=debug, debug_samples=batch_size, max_tokens_per_batch=tpb, **kwargs)
                     return list(res)
                 except Exception as e:
                     if (tpb // 2) < 500:
                         return [None]
-                    res = compute_losses_for_datapoints(dps, batch_size=batch_size, debug_print=debug, debug_samples=batch_size, max_tokens_per_batch=tpb // 2)
+                    kwargs: Dict[str, Any] = {}
+                    if devices_filtered:
+                        kwargs["devices"] = devices_filtered
+                    res = compute_losses_for_datapoints(dps, batch_size=batch_size, debug_print=debug, debug_samples=batch_size, max_tokens_per_batch=tpb // 2, **kwargs)
                     return list(res)
 
             only_dps = [t[2] for t in flat_dps]
             metrics_list_optional = compute_metrics_safe(only_dps, tpb=tok_per_batch)
-            # Assign metrics where available
             for (pos, _key, out_dp), m in zip(flat_dps, metrics_list_optional):
                 if m is not None:
                     out_dp.loss_metrics = LossMetrics(
@@ -182,7 +177,6 @@ def ingest_entities(
         for idx, dp_key, outs in processed_pairs:
             if with_loss:
                 successful_outs = [od for od in outs if od.loss_metrics is not None]
-                # Aggregate totals for cache write decision
                 total_outs += len(outs)
                 success_count = len(successful_outs)
                 total_success += success_count
@@ -252,8 +246,6 @@ def ingest_entities(
             lines = [orjson.dumps(entry) for entry in all_entries]
             out.write('\n'.join([line.decode('utf-8') for line in lines]))
             if cache_write:
-                # Don't persist an empty file cache (prevents sticky empty-cache bug)
-                # Also skip caching when all loss computations failed (no successful outputs)
                 all_loss_failed = bool(with_loss and total_outs > 0 and total_success == 0)
                 should_write_file_cache = len(all_entries) > 0 and not all_loss_failed
                 if not should_write_file_cache:

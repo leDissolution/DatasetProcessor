@@ -10,6 +10,7 @@ from dataset_processor import ingest_entities
 from pipeline import MetaUpdatedPass, MirrorEntitiesPass, PipelineContext, ReplaceUnchangedWithNoopPass, StatUnwinderPass, NameRandomizerPass, DuplicateAugmentationPass
 from Entities.registry import default_registry
 import loss_engine
+from loss_engine import validate_devices
 
 
 def ensure_dirs(*paths: str) -> None:
@@ -47,6 +48,7 @@ def main(argv: Optional[List[str]] = None) -> None:
     parser.add_argument("--with_json", type=str, default="false", help="Also include the raw datapoint as nested JSON (true/false)")
     parser.add_argument("--model_name", type=str, default=default_model_name, help="HF model path/name for loss engine (default: current in loss_engine)")
     parser.add_argument("--clean", type=str, default="false", help="Clean output directory before processing (true/false)")
+    parser.add_argument("--devices", type=str, default=None, help="Comma-separated list of GPU device indices to use for loss computation (e.g. 0,1). If omitted uses defaults in loss_engine. Invalid devices are skipped with a warning.")
 
     args = parser.parse_args(argv)
 
@@ -67,13 +69,31 @@ def main(argv: Optional[List[str]] = None) -> None:
     with_loss = _parse_bool(args.with_loss, True)
     with_json = _parse_bool(args.with_json, False)
 
+    user_devices: Optional[List[int]] = None
+    if args.devices is not None:
+        raw = str(args.devices).strip()
+        if raw:
+            parts = [p.strip() for p in raw.replace(";", ",").split(",") if p.strip()]
+            parsed: List[int] = []
+            for p in parts:
+                try:
+                    parsed.append(int(p))
+                except ValueError:
+                    print(f"[DEVICES] Ignoring non-integer device entry '{p}'.")
+            user_devices = parsed
+        else:
+            user_devices = []
+
+    filtered_devices = validate_devices(user_devices) if user_devices is not None else None
+    if with_loss and user_devices is not None and not filtered_devices:
+        raise SystemExit("No requested GPU devices are available; cannot compute loss metrics.")
+
     try:
         if isinstance(args.model_name, str) and args.model_name:
             loss_engine.MODEL_NAME = args.model_name
     except Exception:
         pass
 
-    # Existing cache flags and batching behavior
     bypass_cache = False
     bypass_file_cache = True
 
@@ -113,6 +133,7 @@ def main(argv: Optional[List[str]] = None) -> None:
                     **({"with_json": with_json}),
                     batch_size=60,
                     tok_per_batch=tok_per_batch,
+                    devices=filtered_devices,
                     pipeline_passes=passes,
                     pipeline_ctx=ctx,
                     cache_read=(not bypass_cache),
@@ -130,6 +151,7 @@ def main(argv: Optional[List[str]] = None) -> None:
                     **({"with_json": with_json}),
                     batch_size=60,
                     tok_per_batch=tok_per_batch,
+                    devices=filtered_devices,
                     pipeline_passes=eval_passes,
                     pipeline_ctx=ctx,
                     cache_read=(not bypass_cache),
@@ -167,6 +189,7 @@ def main(argv: Optional[List[str]] = None) -> None:
                         **({"with_json": with_json}),
                         batch_size=60,
                         tok_per_batch=tok_per_batch,
+                        devices=filtered_devices,
                         pipeline_passes=passes,
                         pipeline_ctx=ctx,
                         cache_read=(not bypass_cache),
