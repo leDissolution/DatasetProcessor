@@ -307,10 +307,10 @@ def compute_loss_signature() -> str:
     return _sha1_bytes(b"|".join(parts))
 
 
-def compute_run_version(passes: Optional[Sequence[Any]], with_loss: bool) -> str:
+def compute_run_version(passes: Optional[Sequence[Any]], with_loss: bool, with_json: bool = False) -> str:
     pl = compute_pipeline_signature(passes)
     ls = compute_loss_signature() if with_loss else "loss:0"
-    return _sha1_bytes((pl + "|" + ls + "|" + str(bool(with_loss))).encode("utf-8"))
+    return _sha1_bytes((pl + "|" + ls + "|" + str(bool(with_loss)) + "|json=" + ("1" if with_json else "0")).encode("utf-8"))
 
 
 def remap_cached_entries_source(entries: List[Dict[str, Any]], new_source_id: str) -> List[Dict[str, Any]]:
@@ -324,6 +324,15 @@ def remap_cached_entries_source(entries: List[Dict[str, Any]], new_source_id: st
             if isinstance(tgt, dict):
                 attr = tgt.get("attr")
             e2["id"] = f"{new_source_id}:{attr or ''}"
+            # If nested datapoint exists, update its source_id as well
+            try:
+                dp_nested = e2.get("datapoint")
+                if isinstance(dp_nested, dict):
+                    dp_nested = dict(dp_nested)
+                    dp_nested["source_id"] = new_source_id
+                    e2["datapoint"] = dp_nested
+            except Exception:
+                pass
             out.append(e2)
         except Exception:
             out.append(e)

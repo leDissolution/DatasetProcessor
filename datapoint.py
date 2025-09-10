@@ -182,6 +182,52 @@ class Datapoint:
         }
         return out
 
+    def to_raw_json(self) -> Dict[str, Any]:
+        """Serialize the raw datapoint structure for debugging/auditing.
+
+        Includes anchors, states, subjects, attributes, and rehydrated text.
+        Safe for JSONL embedding.
+        """
+
+        def _entity_to_json(e: Entity) -> Dict[str, Any]:
+            subj = getattr(e, "subject", None)
+            subj_json: Optional[Dict[str, Any]] = None
+            if subj is not None:
+                subj_json = {"key": getattr(subj, "key", None), "id": getattr(subj, "id", None)}
+            out: Dict[str, Any] = {
+                "type": e.__class__.__name__,
+                "family": getattr(e, "family", None),
+                "tag": getattr(e, "tag", None),
+                "subject": subj_json,
+                "attrs": dict(getattr(e, "attrs", {}) or {}),
+                "attr_order": list(getattr(e, "attr_order", []) or []) or None,
+                "rehydrated": e.rehydrate(),
+            }
+            # Anchors (previous/message) carry text content.
+            text_val = getattr(e, "text", None)
+            if isinstance(text_val, str):
+                out["text"] = text_val
+            return out
+
+        def _target_json() -> Optional[Dict[str, Any]]:
+            if self.target is None:
+                return None
+            return {
+                "entity": getattr(self.target.entity_cls, "__name__", str(self.target.entity_cls)),
+                "subject_id": self.target.subject_id,
+                "attr": self.target.attr,
+            }
+
+        return {
+            "previous_message": _entity_to_json(self.previous_message),
+            "message": _entity_to_json(self.message),
+            "previous_state": [_entity_to_json(e) for e in self.previous_state],
+            "state_context": [_entity_to_json(e) for e in self.state_context],
+            "state": [_entity_to_json(e) for e in self.state],
+            "target": _target_json(),
+            "source_id": self.source_id,
+        }
+
     def clone(self, **overrides: Any) -> "Datapoint":
         """Create a shallow clone with optional field overrides.
 

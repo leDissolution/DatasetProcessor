@@ -44,6 +44,7 @@ def main(argv: Optional[List[str]] = None) -> None:
     parser.add_argument("--with_chats", type=str, default="true", help="Include chat exports (true/false)")
     parser.add_argument("--with_synthetic", type=str, default="true", help="Include synthetic data (true/false)")
     parser.add_argument("--with_loss", type=str, default="true", help="Compute loss metrics (true/false)")
+    parser.add_argument("--with_json", type=str, default="false", help="Also include the raw datapoint as nested JSON (true/false)")
     parser.add_argument("--model_name", type=str, default=default_model_name, help="HF model path/name for loss engine (default: current in loss_engine)")
     parser.add_argument("--clean", type=str, default="false", help="Clean output directory before processing (true/false)")
 
@@ -64,6 +65,7 @@ def main(argv: Optional[List[str]] = None) -> None:
     with_chats = _parse_bool(args.with_chats, True)
     with_synthetic = _parse_bool(args.with_synthetic, True)
     with_loss = _parse_bool(args.with_loss, True)
+    with_json = _parse_bool(args.with_json, False)
 
     try:
         if isinstance(args.model_name, str) and args.model_name:
@@ -75,7 +77,7 @@ def main(argv: Optional[List[str]] = None) -> None:
     bypass_cache = False
     bypass_file_cache = True
 
-    tok_per_batch = 18432
+    tok_per_batch = 10000
 
     total = 0
 
@@ -108,6 +110,7 @@ def main(argv: Optional[List[str]] = None) -> None:
                     fp,
                     out_train,
                     with_loss=with_loss,
+                    **({"with_json": with_json}),
                     batch_size=60,
                     tok_per_batch=tok_per_batch,
                     pipeline_passes=passes,
@@ -124,6 +127,7 @@ def main(argv: Optional[List[str]] = None) -> None:
                     fp,
                     out_eval,
                     with_loss=with_loss,
+                    **({"with_json": with_json}),
                     batch_size=60,
                     tok_per_batch=tok_per_batch,
                     pipeline_passes=eval_passes,
@@ -160,6 +164,7 @@ def main(argv: Optional[List[str]] = None) -> None:
                         fp,
                         out_train,
                         with_loss=with_loss,
+                        **({"with_json": with_json}),
                         batch_size=60,
                         tok_per_batch=tok_per_batch,
                         pipeline_passes=passes,

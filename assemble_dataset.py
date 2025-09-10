@@ -10,6 +10,10 @@ CLI options:
                                                      Include Synthetic data (default: True).
     --with_stage3 / --no-with_stage3
                                                      Write Stage3 outputs (default: False).
+    --big_eval_size N         If > 0, also assemble big_eval.jsonl of size N that includes
+                              the regular eval, all synthetic eval entries, and fills the rest
+                              50/50 from medium and low difficulty buckets. Big eval does not
+                              exclude entries from training.
 """
 
 from collections import defaultdict
@@ -19,6 +23,7 @@ import random
 import statistics
 import argparse
 from typing import List, Dict, Any, Set, Tuple, Optional, Callable
+import math
 
 BASE_PATH = r".\Dataset\Prepared_st2\\"
 # The concrete paths are derived in main() to allow --base_path override.
@@ -214,6 +219,31 @@ def print_zero_loss_sources(zero_loss: List[Dict[str, Any]]) -> None:
             print(f"{id}")
 
 
+def dedupe_entries_by_id(entries: List[Dict[str, Any]], seen_ids: Optional[Set[str]] = None) -> Tuple[List[Dict[str, Any]], Set[str]]:
+    """Return entries with unique ids only, tracking and updating seen_ids.
+
+    If an entry lacks 'id', keep it once using its object id for de-dup within this call.
+    """
+    if seen_ids is None:
+        seen_ids = set()
+    local_noid_seen: Set[int] = set()
+    out: List[Dict[str, Any]] = []
+    for e in entries:
+        eid = e.get('id')
+        if isinstance(eid, str) and eid:
+            if eid in seen_ids:
+                continue
+            seen_ids.add(eid)
+            out.append(e)
+        else:
+            oid = id(e)
+            if oid in local_noid_seen:
+                continue
+            local_noid_seen.add(oid)
+            out.append(e)
+    return out, seen_ids
+
+
 def is_flip(entry: Dict[str, Any]) -> bool:
     """Check if an entry represents a flip (prediction doesn't match actual value)."""
     ct = get_critical_token(entry)
@@ -403,6 +433,7 @@ def main():
     parser.add_argument("--with_chats", action=argparse.BooleanOptionalAction, default=True, help="Include Chat data inputs")
     parser.add_argument("--with_synthetic", action=argparse.BooleanOptionalAction, default=True, help="Include Synthetic data inputs")
     parser.add_argument("--with_stage3", action=argparse.BooleanOptionalAction, default=False, help="Write Stage3 outputs (train.jsonl, eval.jsonl)")
+    parser.add_argument("--big_eval_size", type=int, default=0, help="If > 0, also assemble big_eval.jsonl of this size")
     args = parser.parse_args()
 
     # Resolve paths from base_path (normalize to avoid trailing separators issues)
@@ -425,6 +456,8 @@ def main():
     train = load_jsonl_files(train_files) if train_files else []
     synth_train = load_jsonl_files(synth_train_files) if synth_train_files else []
     eval_data = load_jsonl_files(eval_files) if eval_files else []
+    # Preserve the full synthetic eval (unfiltered) for big eval construction
+    synth_eval_all_unfiltered = list(eval_data)
 
     # Write out the entirety of the synthetic eval data (unfiltered)
     if args.with_synthetic:
@@ -466,11 +499,72 @@ def main():
 
     high_loss, medium_loss, low_loss, zero_loss = create_loss_buckets(train)
 
+    # Build optional Big Eval set (does not affect training contamination)
+    big_eval: List[Dict[str, Any]] = []
+    if args.big_eval_size and args.big_eval_size > 0:
+        # Start with the regular eval (already filtered and topped up)
+        big_eval.extend(eval_data)
+        # Add entire synthetic eval (unfiltered)
+        big_eval_ids: Set[str] = set()
+        for _be in big_eval:
+            _eid = _be.get('id')
+            if isinstance(_eid, str):
+                big_eval_ids.add(_eid)
+        synth_to_add = [e for e in synth_eval_all_unfiltered if not (isinstance(e.get('id'), str) and e.get('id') in big_eval_ids)]
+        big_eval.extend(synth_to_add)
+
+        # Fill the remainder 50/50 from medium and low buckets
+        remaining = args.big_eval_size - len(big_eval)
+        if remaining < 0:
+            print(f"[WARN] big_eval_size ({args.big_eval_size}) is smaller than the mandatory portion (regular eval + all synthetic eval = {len(big_eval)}). Writing {len(big_eval)} entries.")
+            remaining = 0
+
+        if remaining > 0:
+            # Ensure deterministic order from already shuffled buckets
+            half_medium = math.ceil(remaining // 4)
+            half_low = remaining - half_medium
+
+            # Helper to pick unique-by-id entries not already in big_eval
+            def pick_from(bucket: List[Dict[str, Any]], k: int, seen_ids: Set[str]) -> List[Dict[str, Any]]:
+                picked: List[Dict[str, Any]] = []
+                for e in bucket:
+                    eid = e.get('id')
+                    if isinstance(eid, str) and eid in seen_ids:
+                        continue
+                    # respect attr filter for buckets (they already are filtered)
+                    picked.append(e)
+                    if isinstance(eid, str):
+                        seen_ids.add(eid)
+                    if len(picked) >= k:
+                        break
+                return picked
+
+            big_eval_ids = set(big_eval_ids)  # copy for mutation
+            add_medium = pick_from(medium_loss, half_medium, big_eval_ids)
+            add_low = pick_from(low_loss, half_low, big_eval_ids)
+
+            # If one bucket underfilled, top up from the other
+            short = remaining - (len(add_medium) + len(add_low))
+            if short > 0:
+                # Try medium first, then low
+                add_more_m = pick_from([e for e in medium_loss if e not in add_medium], short, big_eval_ids)
+                short -= len(add_more_m)
+                add_more_l: List[Dict[str, Any]] = []
+                if short > 0:
+                    add_more_l = pick_from([e for e in low_loss if e not in add_low], short, big_eval_ids)
+                big_eval.extend(add_medium + add_low + add_more_m + add_more_l)
+            else:
+                big_eval.extend(add_medium + add_low)
+
     eval_data = sorted(eval_data, key=lambda x: len(x.get('prompt', '')))
+
+    synth_train = synth_train * 2
 
     if args.with_stage3:
         write_jsonl_file(os.path.join(STAGE3_PATH, "train.jsonl"), train + synth_train)
         write_jsonl_file(os.path.join(STAGE3_PATH, "eval.jsonl"), eval_data)
+        if args.big_eval_size and args.big_eval_size > 0:
+            write_jsonl_file(os.path.join(STAGE3_PATH, "big_eval.jsonl"), big_eval)
 
     # Print distribution of target stats inside the eval set
     print_eval_stat_counts(eval_data)
@@ -530,6 +624,8 @@ def main():
 
     # Write assembled datasets
     write_jsonl_file(os.path.join(ASSEMBLED_PATH, "eval.jsonl"), eval_data)
+    if args.big_eval_size and args.big_eval_size > 0:
+        write_jsonl_file(os.path.join(ASSEMBLED_PATH, "big_eval.jsonl"), big_eval)
     write_jsonl_file(os.path.join(ASSEMBLED_PATH, "train_high.jsonl"), train_high)
     write_jsonl_file(os.path.join(ASSEMBLED_PATH, "train_low.jsonl"), train_low)
 

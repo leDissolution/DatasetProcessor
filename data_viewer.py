@@ -2,21 +2,10 @@
 """
 JSONL Data Viewer - A simple GUI to browse through JSONL entries with critical token highlighting
 """
-
-import sys
-print("PY:", sys.executable)
-try:
-    import tkinter as tk
-    print("TK:", tk.__file__)
-except Exception as e:
-    print("Import failed:", repr(e))
-    raise
-
 import json
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox, scrolledtext
 import os
-import sys
 
 # Hide console window on Windows
 if os.name == 'nt':

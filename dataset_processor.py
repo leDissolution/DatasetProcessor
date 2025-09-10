@@ -24,6 +24,7 @@ def ingest_entities(
     path: str,
     new_path: str,
     with_loss: bool = True,
+    with_json: bool = False,
     batch_size: int = 35,
     tok_per_batch: int = 26624,
     pipeline_passes: Optional[list] = None,
@@ -68,7 +69,7 @@ def ingest_entities(
     cache = ProcessingCache()
     file_key = os.path.abspath(path)
     file_hash = compute_file_hash(text)
-    version = compute_run_version(pipeline_passes, with_loss)
+    version = compute_run_version(pipeline_passes, with_loss, with_json)
 
     cached_file = cache.get_file(file_key, file_hash, version) if file_cache_read else None
     if cached_file is not None:
@@ -189,7 +190,15 @@ def ingest_entities(
                 if failed:
                     total_failed += len(outs) - success_count
                     total_entries += len(outs)
-                entries_for_dp = [od.to_json() for od in successful_outs]
+                entries_for_dp = []
+                for od in successful_outs:
+                    out = od.to_json()
+                    if with_json:
+                        try:
+                            out["datapoint"] = od.to_raw_json()
+                        except Exception:
+                            pass
+                    entries_for_dp.append(out)
                 new_slices[idx] = entries_for_dp
                 if cache_write and not failed:
                     try:
@@ -197,7 +206,15 @@ def ingest_entities(
                     except Exception:
                         pass
             else:
-                entries_for_dp = [od.to_json() for od in outs]
+                entries_for_dp = []
+                for od in outs:
+                    out = od.to_json()
+                    if with_json:
+                        try:
+                            out["datapoint"] = od.to_raw_json()
+                        except Exception:
+                            pass
+                    entries_for_dp.append(out)
                 new_slices[idx] = entries_for_dp
                 if cache_write:
                     try:
@@ -213,7 +230,13 @@ def ingest_entities(
         elif i in new_slices:
             all_entries.extend(new_slices[i])
         else:
-            all_entries.append(dps[i].to_json())
+            base = dps[i].to_json()
+            if with_json:
+                try:
+                    base["datapoint"] = dps[i].to_raw_json()
+                except Exception:
+                    pass
+            all_entries.append(base)
 
     # Entry-level reuse/regeneration summary (post-pipeline)
     try:
