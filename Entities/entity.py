@@ -280,6 +280,32 @@ class AugmentEntity(Entity):
         except Exception:
             return None
 
+class CharacterEntity(Entity):
+    """<character ... />"""
+
+    family: str = "character"
+    tag: str = "character"
+    subject_required: bool = True
+
+    def __init__(
+        self,
+        *,
+        attrs: Optional[Dict[str, str]] = None,
+        attr_order: Optional[List[str]] = None,
+    ) -> None:
+        subject, attrs, attr_order = self._extract_subject_from_attrs(attrs, attr_order, "name")
+        super().__init__(subject=subject, attrs=attrs, attr_order=attr_order)
+
+    def rehydrate(self) -> str:
+        if not (self.subject and self.subject.key and self.subject.id):
+            return ""
+        subject_part = f"{self.subject.key}=\"{self.subject.id}\""
+        attrs_part = self._attrs_to_str(self.attrs, self.attr_order)
+        parts = [subject_part]
+        if attrs_part:
+            parts.append(attrs_part)
+        inside = " ".join(parts)
+        return f"<{self.tag} {inside} />"
 
 class GenericEntity(Entity):
     """Generic passthrough entity for unknown tags.
