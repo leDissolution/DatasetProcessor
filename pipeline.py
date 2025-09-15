@@ -7,7 +7,7 @@ from functools import lru_cache
 import regex as re
 
 from Entities.registry import EntityRegistry, default_registry
-from Entities.entity import AugmentEntity, CharacterStatsEntity, Entity, StatsEntity, PreviousMessageEntity, MessageEntity, MetaEntity, Subject
+from Entities.entity import AugmentEntity, CharacterStatsEntity, Entity, SceneStatsEntity, StatsEntity, PreviousMessageEntity, MessageEntity, MetaEntity, Subject
 from datapoint import Datapoint, EntityList, Target
 
 
@@ -463,7 +463,10 @@ class NameRandomizerPass(AugmentationPass):
                 skey = e.subject.key if e.subject else None
                 sid = e.subject.id if e.subject else None
                 if skey and isinstance(sid, str) and sid:
-                    new_attrs[skey] = replace_attr_value(sid)
+                    if isinstance(e, SceneStatsEntity):
+                        new_attrs[skey] = replace_in_attr(sid)
+                    else:
+                        new_attrs[skey] = replace_attr_value(sid)
                 try:
                     new_e = e.__class__(attrs=new_attrs, attr_order=getattr(e, "attr_order", None))
                     if skey and isinstance(sid, str) and sid and (new_e.subject is None or new_e.subject.key is None):
