@@ -21,7 +21,12 @@ def ensure_dirs(*paths: str) -> None:
 def list_txt_files(folder: str) -> List[str]:
     if not os.path.isdir(folder):
         return []
-    return [os.path.join(folder, f) for f in os.listdir(folder) if f.lower().endswith('.txt')]
+    txt_files = []
+    for root, _, files in os.walk(folder):
+        for f in files:
+            if f.lower().endswith('.txt'):
+                txt_files.append(os.path.join(root, f))
+    return txt_files
 
 
 def _parse_bool(val: Optional[str], default: bool) -> bool:
