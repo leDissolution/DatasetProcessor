@@ -310,7 +310,7 @@ class NameRandomizerPass(AugmentationPass):
     name = "NameRandomizerPass"
 
     NAMES_TO_EXCLUDE: Set[str] = {
-        "System", "Rat", "Older boy", "Orion (older boy)", "Teen one", "Teen two", "Boy", "Girl", "Doctor"
+        "System", "Rat", "Squirrel", "Older boy", "Orion (older boy)", "Teen one", "Teen two", "Boy", "Girl", "Doctor", "Client"
     }
 
     NAMES = [
