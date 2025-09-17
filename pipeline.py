@@ -310,7 +310,7 @@ class NameRandomizerPass(AugmentationPass):
     name = "NameRandomizerPass"
 
     NAMES_TO_EXCLUDE: Set[str] = {
-        "System", "Rat", "Older boy", "Orion (older boy)", "Teen one", "Teen two"
+        "System", "Rat", "Older boy", "Orion (older boy)", "Teen one", "Teen two", "Boy", "Girl", "Doctor"
     }
 
     NAMES = [
@@ -525,15 +525,21 @@ class NameRandomizerPass(AugmentationPass):
         new_target = dp.target
         if dp.target is not None and isinstance(dp.target.subject_id, str):
             sid = dp.target.subject_id
+            new_sid: Optional[str] = None
             if sid not in self.NAMES_TO_EXCLUDE and sid in base_map:
                 base = base_map[sid]
                 new_sid = get_composite(base) if comp_flag.get(sid, False) else base
-                if new_sid != sid:
-                    new_target = Target(
-                        entity_cls=dp.target.entity_cls,
-                        subject_id=new_sid,
-                        attr=dp.target.attr,
-                    )
+            else:
+                replaced = replace_in_attr(sid)
+                if replaced != sid:
+                    new_sid = replaced
+
+            if new_sid is not None and new_sid != sid:
+                new_target = Target(
+                    entity_cls=dp.target.entity_cls,
+                    subject_id=new_sid,
+                    attr=dp.target.attr,
+                )
 
         new_dp = dp.clone(
             previous_message=new_prev_msg,
@@ -556,4 +562,5 @@ __all__ = [
     "DuplicateAugmentationPass",
     "DuplicateChangeAugmentationPass",
     "NameRandomizerPass",
+    "ReplaceUnchangedWithNoopPass",
 ]
