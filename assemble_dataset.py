@@ -29,8 +29,8 @@ BASE_PATH = r".\Dataset\Prepared_st2\\"
 # The concrete paths are derived in main() to allow --base_path override.
 
 BATCH_SIZE = 24
-REQUIRED_COUNT = 1000 * BATCH_SIZE
-REGULARIZATION_COUNT = 700 * BATCH_SIZE
+REQUIRED_COUNT = 1200 * BATCH_SIZE
+REGULARIZATION_COUNT = 500 * BATCH_SIZE
 
 EVAL_BATCH_SIZE = 18
 EVAL_BATCHES = 30
