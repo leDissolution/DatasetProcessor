@@ -326,7 +326,9 @@ class NameRandomizerPass(AugmentationPass):
         "Vex", "Wave", "Xael", "Yang", "Zale", "Atlas", "Brook", "Cloud",
         "Dune", "East", "Frost", "Grove", "Heath", "Inlet", "June", "Kite",
         "Lark", "Mist", "North", "Orion", "Peak", "Quest", "Reed", "Star",
-        "Trace", "Umber", "Vale", "West", "Kin'astra", "Yarrow", "Franco"
+        "Trace", "Umber", "Vale", "West", "Kin'astra", "Yarrow", "Franco",
+        "Liora", "Soren", "Thane", "Vesper", "Zinnia", "Calder", "Elara",
+        "Lyric", "Maven", "Nyx", "Onyx", "Pax", "Quilla", "Rune", "Sylas"
     ]
 
     _COMPOSITE_TEMPLATES = [

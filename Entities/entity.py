@@ -218,7 +218,8 @@ class SceneStatsEntity(StatsEntity):
 
     STAT_CONFIG = {
         'fixtures': {'dependencies': [], 'order': 0, 'defaultValue': 'unspecified', 'concrete': True},
-        'items': {'dependencies': ['fixtures'], 'order': 1, 'defaultValue': 'unspecified', 'concrete': True}
+        'items': {'dependencies': ['fixtures'], 'order': 1, 'defaultValue': 'unspecified', 'concrete': True},
+        'passages': {'dependencies': [], 'order': 2, 'defaultValue': 'unspecified', 'concrete': True}
     }
 
     def __init__(
