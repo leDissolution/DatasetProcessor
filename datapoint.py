@@ -172,9 +172,15 @@ class Datapoint:
         if (self.target and expected_value == "!!no_change!!"):
             expected_value = self.previous_state.target_value(self.target, default=expected_value)
 
+        id = self.source_id
+        if self.target and self.target.subject_id:
+            id += f":{self.target.subject_id}"
+        if self.target and self.target.attr:
+            id += f":{self.target.attr}"
+
         out: Dict[str, Any] = {
             "prompt": prompt,
-            "id": self.source_id + ":" + str(self.target.attr if self.target else ""),
+            "id": id,
             "source_id": self.source_id,
             "target": target_json,
             "loss_metrics": loss_metrics_json,

@@ -434,6 +434,12 @@ def main():
     parser.add_argument("--with_synthetic", action=argparse.BooleanOptionalAction, default=True, help="Include Synthetic data inputs")
     parser.add_argument("--with_stage3", action=argparse.BooleanOptionalAction, default=False, help="Write Stage3 outputs (train.jsonl, eval.jsonl)")
     parser.add_argument("--big_eval_size", type=int, default=0, help="If > 0, also assemble big_eval.jsonl of this size")
+    parser.add_argument(
+        "--tokenizer_path",
+        type=str,
+        default=r".\Models\g2b-stage1",
+        help="Tokenizer path or model id for AutoTokenizer.from_pretrained",
+    )
     args = parser.parse_args()
 
     # Resolve paths from base_path (normalize to avoid trailing separators issues)
@@ -648,7 +654,7 @@ def main():
     # Print top-10 longest tokenized prompts in train_high, unique by source_id (pick longest per source_id)
     try:
         from transformers import AutoTokenizer
-        tokenizer = AutoTokenizer.from_pretrained(r".\Models\g2b-stage1")
+        tokenizer = AutoTokenizer.from_pretrained(args.tokenizer_path)
         # Map from source_id to (prompt_length, entry)
         source_id_to_entry = {}
         for entry in train_high:
@@ -665,6 +671,31 @@ def main():
             tokens = tokenizer.encode(prompt)
             tokenized_lengths.append((len(tokens), entry))
         tokenized_lengths.sort(reverse=True, key=lambda x: x[0])
+        # Length stats
+        lengths = [t for t, _ in tokenized_lengths]
+        if lengths:
+            try:
+                mean_len = statistics.mean(lengths)
+            except Exception:
+                mean_len = 0.0
+            # Median (p50)
+            p50 = statistics.median(lengths)
+            # Percentiles helper (linear interpolation between closest ranks)
+            def percentile(data, p):
+                if not data:
+                    return 0
+                xs = sorted(data)
+                k = (len(xs)-1) * (p/100.0)
+                f = math.floor(k)
+                c = math.ceil(k)
+                if f == c:
+                    return xs[int(k)]
+                d0 = xs[f] * (c - k)
+                d1 = xs[c] * (k - f)
+                return d0 + d1
+            p90 = percentile(lengths, 90)
+            p95 = percentile(lengths, 95)
+            print(f"Tokenized length stats (unique by source_id in train_high): mean={mean_len:.1f}, p50={p50:.1f}, p90={p90:.1f}, p95={p95:.1f}")
         print("Top 10 longest tokenized prompts in train_high (unique by source_id):")
         for i, (tok_len, entry) in enumerate(tokenized_lengths[:10], 1):
             print(f"{i:2d}. Tokens: {tok_len:4d} | ID: {entry.get('id','unknown')} | Prompt: {entry.get('prompt','')[:80]}...")
