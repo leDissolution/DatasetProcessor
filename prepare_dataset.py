@@ -54,6 +54,7 @@ def main(argv: Optional[List[str]] = None) -> None:
     parser.add_argument("--model_name", type=str, default=default_model_name, help="HF model path/name for loss engine (default: current in loss_engine)")
     parser.add_argument("--clean", type=str, default="false", help="Clean output directory before processing (true/false)")
     parser.add_argument("--devices", type=str, default=None, help="Comma-separated list of GPU device indices to use for loss computation (e.g. 0,1). If omitted uses defaults in loss_engine. Invalid devices are skipped with a warning.")
+    parser.add_argument("--stats", type=str, default=None, help="Comma-separated stat attribute names to include (case-insensitive). Default processes all stats.")
 
     args = parser.parse_args(argv)
 
@@ -73,6 +74,15 @@ def main(argv: Optional[List[str]] = None) -> None:
     with_synthetic = _parse_bool(args.with_synthetic, True)
     with_loss = _parse_bool(args.with_loss, True)
     with_json = _parse_bool(args.with_json, False)
+
+    stats_filter: Optional[List[str]] = None
+    if isinstance(args.stats, str):
+        raw_stats = args.stats.strip()
+        if raw_stats:
+            parts = [p.strip().lower() for p in raw_stats.replace(";", ",").split(",") if p.strip()]
+            if parts:
+                stats_filter = parts
+                print(f"Restricting processing to stats: {', '.join(stats_filter)}")
 
     user_devices: Optional[List[int]] = None
     if args.devices is not None:
@@ -145,6 +155,7 @@ def main(argv: Optional[List[str]] = None) -> None:
                     file_cache_read=(not bypass_file_cache),
                     cache_write=True,
                     debug=False,
+                    allowed_stats=stats_filter,
                 )
 
                 out_eval = os.path.join(chat_out, f"{name}.eval.jsonl")
@@ -162,6 +173,7 @@ def main(argv: Optional[List[str]] = None) -> None:
                     cache_read=(not bypass_cache),
                     file_cache_read=(not bypass_file_cache),
                     cache_write=True,
+                    allowed_stats=stats_filter,
                 )
                 total += 1
             except Exception as e:
@@ -200,6 +212,7 @@ def main(argv: Optional[List[str]] = None) -> None:
                         cache_read=(not bypass_cache),
                         file_cache_read=(not bypass_file_cache),
                         cache_write=True,
+                        allowed_stats=stats_filter,
                     )
                     total += 1
                 except Exception as e:

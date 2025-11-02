@@ -1,7 +1,7 @@
 import orjson
 import os
 import random
-from typing import Optional, List, Dict, Any, Tuple
+from typing import Optional, List, Dict, Any, Tuple, Sequence, Set
 from entity_parser import parse_text
 from datapoint import Datapoint, LossMetrics
 from loss_engine import compute_losses_for_datapoints, validate_devices
@@ -30,6 +30,7 @@ def ingest_entities(
     file_cache_read: Optional[bool] = None,
     cache_write: Optional[bool] = None,
     debug: bool = False,
+    allowed_stats: Optional[Sequence[str]] = None,
 ) -> None:
     """Parallel ingestion using the new entity parser with optional pipeline processing.
 
@@ -57,10 +58,47 @@ def ingest_entities(
     if file_cache_read is None:
         file_cache_read = (cache_read is True) and (not env_skip_file_read) or (cache_read is False and False) or (cache_read is None and (not env_skip_file_read))
 
+    stats_set: Optional[Set[str]] = None
+    stats_key: Optional[Tuple[str, ...]] = None
+    if allowed_stats:
+        cleaned: List[str] = []
+        for entry in allowed_stats:
+            if not isinstance(entry, str):
+                continue
+            name = entry.strip().lower()
+            if not name:
+                continue
+            cleaned.append(name)
+        if cleaned:
+            stats_set = set(cleaned)
+            stats_key = tuple(sorted(stats_set))
+
+    def _dp_allowed(dp: Datapoint) -> bool:
+        if stats_set is None:
+            return True
+        target = getattr(dp, "target", None)
+        if target is None:
+            return False
+        attr = getattr(target, "attr", None)
+        if not isinstance(attr, str):
+            return False
+        return attr.lower() in stats_set
+
+    def _entry_allowed(entry: Dict[str, Any]) -> bool:
+        if stats_set is None:
+            return True
+        target = entry.get("target")
+        if not isinstance(target, dict):
+            return False
+        attr = target.get("attr")
+        if not isinstance(attr, str):
+            return False
+        return attr.lower() in stats_set
+
     cache = ProcessingCache()
     file_key = os.path.abspath(path)
     file_hash = compute_file_hash(text)
-    version = compute_run_version(pipeline_passes, with_loss, with_json)
+    version = compute_run_version(pipeline_passes, with_loss, with_json, stats_key)
 
     cached_file = cache.get_file(file_key, file_hash, version) if file_cache_read else None
     if cached_file is not None:
@@ -100,7 +138,10 @@ def ingest_entities(
         dp_keys.append(dp_key)
         cached = cache.get_dp(dp_key, version) if cache_read else None
         if cached is not None:
-            cached_slices[idx] = remap_cached_entries_source(cached, dp.source_id)
+            remapped = remap_cached_entries_source(cached, dp.source_id)
+            if stats_set is not None:
+                remapped = [entry for entry in remapped if _entry_allowed(entry)]
+            cached_slices[idx] = remapped
         else:
             misses.append((idx, dp, dp_key))
 
@@ -131,6 +172,17 @@ def ingest_entities(
         else:
             for idx, dp, dp_key in misses:
                 processed_pairs.append((idx, dp_key, [dp]))
+
+        skipped_empty: List[Tuple[int, str]] = []
+        if stats_set is not None:
+            filtered_pairs: List[Tuple[int, str, List[Datapoint]]] = []
+            for idx, dp_key, outs in processed_pairs:
+                allowed_outs = [out_dp for out_dp in outs if _dp_allowed(out_dp)]
+                if allowed_outs:
+                    filtered_pairs.append((idx, dp_key, allowed_outs))
+                else:
+                    skipped_empty.append((idx, dp_key))
+            processed_pairs = filtered_pairs
 
         flat_dps: List[Tuple[int, str, Datapoint]] = []
         for idx, dp_key, outs in processed_pairs:
@@ -215,6 +267,14 @@ def ingest_entities(
                         cache.set_dp(dp_key, version, entries_for_dp)
                     except Exception:
                         pass
+
+        for idx, dp_key in skipped_empty:
+            new_slices[idx] = []
+            if cache_write:
+                try:
+                    cache.set_dp(dp_key, version, [])
+                except Exception:
+                    pass
 
         print(f"[LOSS] Failed {total_failed} out of {total_entries}")
 

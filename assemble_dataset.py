@@ -211,12 +211,32 @@ def print_top_unique_sources(entries: List[Dict[str, Any]], limit: int = 50) -> 
 
 
 def print_zero_loss_sources(zero_loss: List[Dict[str, Any]]) -> None:
-    """Print unique zero loss source IDs."""
-    if len(zero_loss) > 0:
-        print(f"Zero loss entries: {len(zero_loss)}")
-        zero_loss_ids = {entry['id'] for entry in zero_loss if 'id' in entry}
-        for id in zero_loss_ids:
-            print(f"{id}")
+    """Print zero-loss counts aggregated per source file for easier scanning."""
+    if not zero_loss:
+        print("Zero loss entries: 0")
+        return
+
+    zero_loss_total = len(zero_loss)
+    per_file: Dict[str, Set[str]] = defaultdict(set)
+    unknown_ids = 0
+
+    for entry in zero_loss:
+        eid = entry.get('id')
+        if not isinstance(eid, str) or not eid:
+            unknown_ids += 1
+            continue
+        source = eid.split(':', 1)[0]
+        per_file[source].add(eid)
+
+    unique_total = sum(len(ids) for ids in per_file.values())
+    print(f"Zero loss entries: {zero_loss_total} (unique ids: {unique_total})")
+
+    for source in sorted(per_file.keys()):
+        count = len(per_file[source])
+        print(f"{source}: {count}")
+
+    if unknown_ids:
+        print(f"<unknown>: {unknown_ids}")
 
 
 def dedupe_entries_by_id(entries: List[Dict[str, Any]], seen_ids: Optional[Set[str]] = None) -> Tuple[List[Dict[str, Any]], Set[str]]:

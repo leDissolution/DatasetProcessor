@@ -307,10 +307,23 @@ def compute_loss_signature() -> str:
     return _sha1_bytes(b"|".join(parts))
 
 
-def compute_run_version(passes: Optional[Sequence[Any]], with_loss: bool, with_json: bool = False) -> str:
+def compute_run_version(
+    passes: Optional[Sequence[Any]],
+    with_loss: bool,
+    with_json: bool = False,
+    stats_filter: Optional[Sequence[str]] = None,
+) -> str:
     pl = compute_pipeline_signature(passes)
     ls = compute_loss_signature() if with_loss else "loss:0"
-    return _sha1_bytes((pl + "|" + ls + "|" + str(bool(with_loss)) + "|json=" + ("1" if with_json else "0")).encode("utf-8"))
+    stats_sig = "stats:*" if not stats_filter else "stats:" + ",".join(stats_filter)
+    payload = "|".join([
+        pl,
+        ls,
+        str(bool(with_loss)),
+        "json=" + ("1" if with_json else "0"),
+        stats_sig,
+    ])
+    return _sha1_bytes(payload.encode("utf-8"))
 
 
 def remap_cached_entries_source(entries: List[Dict[str, Any]], new_source_id: str) -> List[Dict[str, Any]]:
