@@ -10,10 +10,13 @@ CLI options:
                                                      Include Synthetic data (default: True).
     --with_stage3 / --no-with_stage3
                                                      Write Stage3 outputs (default: False).
+    --exclude_top_percentile X Exclude the top X percent most difficult entries (default: 0).
     --big_eval_size N         If > 0, also assemble big_eval.jsonl of size N that includes
                               the regular eval, all synthetic eval entries, and fills the rest
                               50/50 from medium and low difficulty buckets. Big eval does not
                               exclude entries from training.
+    --train_file_name NAME    Output filename for the Stage 2 train split (default: train_high.jsonl).
+    --eval_file_name NAME     Output filename for the Stage 2 eval split (default: eval.jsonl).
 """
 
 from collections import defaultdict
@@ -90,6 +93,24 @@ def filter_entries_by_attr(entries: List[Dict[str, Any]], predicate: Callable[[s
         if predicate(get_target_attr(e)):
             out.append(e)
     return out
+
+
+def exclude_top_difficulty_percentile(entries: List[Dict[str, Any]], percentile: float) -> List[Dict[str, Any]]:
+    """Remove the highest-difficulty entries corresponding to the given percentile."""
+    if not entries or percentile <= 0:
+        return entries
+
+    clamped = max(0.0, min(100.0, percentile))
+    if clamped == 0.0:
+        return entries
+
+    sorted_entries = sorted(entries, key=get_completion_difficulty, reverse=True)
+    remove_count = math.ceil(len(sorted_entries) * clamped / 100.0)
+    if remove_count <= 0:
+        return entries
+
+    ids_to_remove = {id(entry) for entry in sorted_entries[:remove_count]}
+    return [entry for entry in entries if id(entry) not in ids_to_remove]
 
 
 def ensure_directories(*paths: str) -> None:
@@ -460,6 +481,24 @@ def main():
         default=r".\Models\g2b-stage1",
         help="Tokenizer path or model id for AutoTokenizer.from_pretrained",
     )
+    parser.add_argument(
+        "--exclude_top_percentile",
+        type=float,
+        default=0.0,
+        help="Exclude the top X percent of highest-difficulty entries from each training pool",
+    )
+    parser.add_argument(
+        "--train_file_name",
+        type=str,
+        default="train_high.jsonl",
+        help="File name for the assembled high-priority training split",
+    )
+    parser.add_argument(
+        "--eval_file_name",
+        type=str,
+        default="eval.jsonl",
+        help="File name for the assembled evaluation split",
+    )
     args = parser.parse_args()
 
     # Resolve paths from base_path (normalize to avoid trailing separators issues)
@@ -500,6 +539,20 @@ def main():
     train = filter_entries_by_attr(train)
     synth_train = filter_entries_by_attr(synth_train)
     eval_data = filter_entries_by_attr(eval_data)
+
+    if args.exclude_top_percentile > 0:
+        pct = max(0.0, min(100.0, args.exclude_top_percentile))
+        before_train = len(train)
+        train = exclude_top_difficulty_percentile(train, pct)
+        print(
+            f"Excluded {before_train - len(train)} entries from chat training pool (top {pct}% difficulty)"
+        )
+        if synth_train:
+            before_synth = len(synth_train)
+            synth_train = exclude_top_difficulty_percentile(synth_train, pct)
+            print(
+                f"Excluded {before_synth - len(synth_train)} entries from synthetic training pool (top {pct}% difficulty)"
+            )
 
     high_loss, medium_loss, low_loss, zero_loss = create_loss_buckets(train)
 
@@ -649,10 +702,13 @@ def main():
     random.shuffle(train_high)
 
     # Write assembled datasets
-    write_jsonl_file(os.path.join(ASSEMBLED_PATH, "eval.jsonl"), eval_data)
+    train_output_path = os.path.join(ASSEMBLED_PATH, args.train_file_name)
+    eval_output_path = os.path.join(ASSEMBLED_PATH, args.eval_file_name)
+
+    write_jsonl_file(eval_output_path, eval_data)
     if args.big_eval_size and args.big_eval_size > 0:
         write_jsonl_file(os.path.join(ASSEMBLED_PATH, "big_eval.jsonl"), big_eval)
-    write_jsonl_file(os.path.join(ASSEMBLED_PATH, "train_high.jsonl"), train_high)
+    write_jsonl_file(train_output_path, train_high)
     write_jsonl_file(os.path.join(ASSEMBLED_PATH, "train_low.jsonl"), train_low)
 
     # Analysis and reporting
@@ -675,6 +731,57 @@ def main():
     try:
         from transformers import AutoTokenizer
         tokenizer = AutoTokenizer.from_pretrained(args.tokenizer_path)
+        # Track total completion token usage for the finalized training split
+        completion_token_lengths: List[int] = []
+        missing_completion_entries = 0
+        completion_texts: List[str] = []
+        for entry in train_high:
+            completion_text = entry.get("expected_value")
+            if not isinstance(completion_text, str) or not completion_text:
+                completion_text = entry.get("completion") or entry.get("response") or ""
+            if not completion_text:
+                missing_completion_entries += 1
+                continue
+            completion_texts.append(completion_text)
+
+        if completion_texts:
+            try:
+                batch = tokenizer(
+                    completion_texts,
+                    add_special_tokens=False,
+                    return_length=True,
+                    padding=False,
+                    truncation=False,
+                )
+                lengths = batch.get("length")
+                if isinstance(lengths, list):
+                    completion_token_lengths.extend(int(v) for v in lengths)
+                elif lengths is not None:
+                    completion_token_lengths.extend(int(v) for v in list(lengths))
+                else:
+                    input_ids = batch.get("input_ids")
+                    if isinstance(input_ids, list):
+                        completion_token_lengths.extend(len(ids) for ids in input_ids if isinstance(ids, list))
+            except Exception:
+                # Fallback to per-entry tokenization if batching fails
+                for text in completion_texts:
+                    try:
+                        completion_token_lengths.append(len(tokenizer.encode(text, add_special_tokens=False)))
+                    except Exception:
+                        pass
+
+        total_completion_tokens = sum(completion_token_lengths)
+        if completion_token_lengths:
+            avg_completion_tokens = statistics.mean(completion_token_lengths)
+            max_completion_tokens = max(completion_token_lengths)
+            print(
+                f"Completion tokens (train_high): total={total_completion_tokens}, mean={avg_completion_tokens:.1f}, max={max_completion_tokens}"
+            )
+        else:
+            print("Completion tokens (train_high): total=0")
+
+        if missing_completion_entries:
+            print(f"[INFO] Missing completion text in {missing_completion_entries} train_high entries")
         # Map from source_id to (prompt_length, entry)
         source_id_to_entry = {}
         for entry in train_high:
@@ -686,10 +793,43 @@ def main():
             if source_id not in source_id_to_entry or len(prompt) > len(source_id_to_entry[source_id][1].get("prompt", "")):
                 source_id_to_entry[source_id] = (prompt, entry)
         # Now tokenize and sort by tokenized length
-        tokenized_lengths = []
-        for prompt, entry in source_id_to_entry.values():
-            tokens = tokenizer.encode(prompt)
-            tokenized_lengths.append((len(tokens), entry))
+        tokenized_lengths: List[Tuple[int, Dict[str, Any]]] = []
+        prompt_entries = list(source_id_to_entry.values())
+        if prompt_entries:
+            prompts = [p for p, _ in prompt_entries]
+            entries_for_prompts = [e for _, e in prompt_entries]
+            try:
+                batch = tokenizer(
+                    prompts,
+                    add_special_tokens=True,
+                    return_length=True,
+                    padding=False,
+                    truncation=False,
+                )
+                lengths = batch.get("length")
+                prompt_lengths: List[int]
+                if isinstance(lengths, list):
+                    prompt_lengths = [int(v) for v in lengths]
+                elif lengths is not None:
+                    prompt_lengths = [int(v) for v in list(lengths)]
+                else:
+                    input_ids = batch.get("input_ids")
+                    if isinstance(input_ids, list):
+                        prompt_lengths = [len(ids) for ids in input_ids if isinstance(ids, list)]
+                    else:
+                        prompt_lengths = []
+                if len(prompt_lengths) != len(entries_for_prompts):
+                    raise ValueError("Tokenized length count mismatch for prompts")
+                tokenized_lengths = [(prompt_lengths[i], entries_for_prompts[i]) for i in range(len(entries_for_prompts))]
+            except Exception:
+                # Fallback to per-entry tokenization if batching fails
+                fallback_lengths: List[Tuple[int, Dict[str, Any]]] = []
+                for prompt, entry in prompt_entries:
+                    try:
+                        fallback_lengths.append((len(tokenizer.encode(prompt)), entry))
+                    except Exception:
+                        pass
+                tokenized_lengths = fallback_lengths
         tokenized_lengths.sort(reverse=True, key=lambda x: x[0])
         # Length stats
         lengths = [t for t, _ in tokenized_lengths]
