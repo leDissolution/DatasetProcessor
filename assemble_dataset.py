@@ -11,6 +11,8 @@ CLI options:
     --with_stage3 / --no-with_stage3
                                                      Write Stage3 outputs (default: False).
     --exclude_top_percentile X Exclude the top X percent most difficult entries (default: 0).
+    --exclude_top_percentile_min_difficulty V
+                              Only consider entries with difficulty >= V when applying percentile filtering (default: 0).
     --existing_eval_file PATH Reuse an existing eval JSONL and filter its IDs from training (default: none).
     --big_eval_size N         If > 0, also assemble big_eval.jsonl of size N that includes
                               the regular eval, all synthetic eval entries, and fills the rest
@@ -40,8 +42,8 @@ EVAL_BATCH_SIZE = 18
 EVAL_BATCHES = 30
 REPLACE_EVAL_THRESHOLD = 0.05
 
-HIGH_LOSS_THRESHOLD = 3.0
-MEDIUM_LOSS_MIN = 0.4
+HIGH_LOSS_THRESHOLD = 3
+MEDIUM_LOSS_MIN = 0.5
 LOW_LOSS_MIN = 0.0
 
 # Deterministic RNG seed for stable shuffles across runs
@@ -96,8 +98,13 @@ def filter_entries_by_attr(entries: List[Dict[str, Any]], predicate: Callable[[s
     return out
 
 
-def exclude_top_difficulty_percentile(entries: List[Dict[str, Any]], percentile: float) -> List[Dict[str, Any]]:
-    """Remove the highest-difficulty entries corresponding to the given percentile."""
+def exclude_top_difficulty_percentile(
+    entries: List[Dict[str, Any]], percentile: float, min_difficulty: float = 0.0
+) -> List[Dict[str, Any]]:
+    """Remove the highest-difficulty entries corresponding to the given percentile.
+
+    Only entries with completion_difficulty >= min_difficulty are considered eligible for removal.
+    """
     if not entries or percentile <= 0:
         return entries
 
@@ -105,12 +112,16 @@ def exclude_top_difficulty_percentile(entries: List[Dict[str, Any]], percentile:
     if clamped == 0.0:
         return entries
 
-    sorted_entries = sorted(entries, key=get_completion_difficulty, reverse=True)
-    remove_count = math.ceil(len(sorted_entries) * clamped / 100.0)
+    eligible = [entry for entry in entries if get_completion_difficulty(entry) >= min_difficulty]
+    if not eligible:
+        return entries
+
+    remove_count = math.ceil(len(eligible) * clamped / 100.0)
     if remove_count <= 0:
         return entries
 
-    ids_to_remove = {id(entry) for entry in sorted_entries[:remove_count]}
+    sorted_eligible = sorted(eligible, key=get_completion_difficulty, reverse=True)
+    ids_to_remove = {id(entry) for entry in sorted_eligible[:remove_count]}
     return [entry for entry in entries if id(entry) not in ids_to_remove]
 
 
@@ -465,6 +476,48 @@ def print_eval_stat_counts(eval_entries: List[Dict[str, Any]]) -> None:
     print(f"Total eval entries: {total}")
 
 
+def plot_difficulty_histogram(difficulties: List[float], output_path: Optional[str] = None) -> None:
+    """Plot or save a histogram of completion_difficulty values."""
+    filtered: List[float] = []
+    for d in difficulties:
+        try:
+            val = float(d)
+        except (TypeError, ValueError):
+            continue
+        if math.isfinite(val):
+            filtered.append(val)
+    if not filtered:
+        print("No completion_difficulty values to plot.")
+        return
+
+    try:
+        import matplotlib.pyplot as plt  # type: ignore
+    except ImportError:
+        print("[ERROR] matplotlib is required for --plot_difficulty_hist. Install it with `pip install matplotlib`.")
+        return
+
+    plt.figure(figsize=(10, 6))
+    # Bin count derived from data volume with sensible defaults
+    bin_count = min(100, max(10, int(math.sqrt(len(filtered))) or 10))
+    plt.hist(filtered, bins=bin_count, color="steelblue", edgecolor="black", alpha=0.85)
+    plt.title("Completion Difficulty Distribution")
+    plt.xlabel("completion_difficulty")
+    plt.ylabel("Count")
+    plt.grid(axis="y", alpha=0.3)
+    plt.tight_layout()
+
+    if output_path:
+        directory = os.path.dirname(os.path.abspath(output_path))
+        if directory:
+            os.makedirs(directory, exist_ok=True)
+        plt.savefig(output_path)
+        print(f"Wrote histogram to {os.path.abspath(output_path)}")
+    else:
+        plt.show()
+
+    plt.close()
+
+
 def main():
     """Main dataset assembly process."""
     # Parse CLI arguments
@@ -489,10 +542,27 @@ def main():
         help="Exclude the top X percent of highest-difficulty entries from each training pool",
     )
     parser.add_argument(
+        "--exclude_top_percentile_min_difficulty",
+        type=float,
+        default=0.0,
+        help="Minimum completion_difficulty an entry must have to be eligible for percentile exclusion",
+    )
+    parser.add_argument(
         "--existing_eval_file",
         type=str,
         default="",
         help="Path (absolute or relative to Assembled/) of an eval JSONL to reuse",
+    )
+    parser.add_argument(
+        "--plot_difficulty_hist",
+        action="store_true",
+        help="Plot completion_difficulty histogram from loaded training pools and exit",
+    )
+    parser.add_argument(
+        "--difficulty_hist_output",
+        type=str,
+        default="",
+        help="Optional path to save the histogram when --plot_difficulty_hist is used",
     )
     parser.add_argument(
         "--train_file_name",
@@ -558,19 +628,24 @@ def main():
     synth_train = filter_entries_by_attr(synth_train)
     eval_data = filter_entries_by_attr(eval_data)
 
+    if args.plot_difficulty_hist:
+        histogram_entries = list(train)
+        histogram_entries.extend(synth_train)
+        histogram_entries.extend(eval_data)
+        difficulties = [get_completion_difficulty(entry) for entry in histogram_entries]
+        output_path = args.difficulty_hist_output.strip() or None
+        plot_difficulty_histogram(difficulties, output_path)
+        return
+
     if args.exclude_top_percentile > 0:
         pct = max(0.0, min(100.0, args.exclude_top_percentile))
+        pct_floor = args.exclude_top_percentile_min_difficulty
+        eligible_train = sum(1 for entry in train if get_completion_difficulty(entry) >= pct_floor)
         before_train = len(train)
-        train = exclude_top_difficulty_percentile(train, pct)
+        train = exclude_top_difficulty_percentile(train, pct, pct_floor)
         print(
-            f"Excluded {before_train - len(train)} entries from chat training pool (top {pct}% difficulty)"
+            f"Excluded {before_train - len(train)} entries from chat training pool (top {pct}% difficulty over {eligible_train} eligible entries with difficulty >= {pct_floor})"
         )
-        if synth_train:
-            before_synth = len(synth_train)
-            synth_train = exclude_top_difficulty_percentile(synth_train, pct)
-            print(
-                f"Excluded {before_synth - len(synth_train)} entries from synthetic training pool (top {pct}% difficulty)"
-            )
 
     use_existing_eval = existing_eval_path is not None
     if use_existing_eval:
@@ -690,7 +765,7 @@ def main():
 
     print_bucket_stats(high_loss, medium_loss, low_loss, zero_loss, synth_train, train)
 
-    train += high_loss * 2 + medium_loss
+    train += high_loss * 3 + medium_loss * 2
 
     # Create Stage 2 dataset (high-quality subset)
     count = REQUIRED_COUNT - len(synth_train)

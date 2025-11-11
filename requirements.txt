@@ -2,3 +2,4 @@ orjson==3.11.3
 regex==2025.7.34
 tqdm==4.67.1
 transformers==4.48.3
+matplotlib==3.9.0

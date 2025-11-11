@@ -35,6 +35,12 @@ class DataViewer:
         self.search_var = tk.StringVar()
         self.filtered_data = []  # filtered by search
         self.current_search = ""
+        self.metric_labels = {
+            "worst_loss": "Worst Loss",
+            "completion_difficulty": "Completion Difficulty",
+        }
+        self.metric_keys_by_label = {label: key for key, label in self.metric_labels.items()}
+        self.sort_choice = tk.StringVar(value=self.metric_labels["worst_loss"])
         
         self.setup_ui()
         self.bind_keys()
@@ -99,6 +105,18 @@ class DataViewer:
         
         # Button to print flips per source file
         ttk.Button(nav_frame, text="Flips per Source File", command=self.print_flips_per_source_file).grid(row=0, column=12, padx=(10, 0))
+
+        ttk.Label(nav_frame, text="Sort by:").grid(row=0, column=13, padx=(10, 0))
+        self.sort_combobox = ttk.Combobox(
+            nav_frame,
+            textvariable=self.sort_choice,
+            values=list(self.metric_labels.values()),
+            state="readonly",
+            width=22,
+        )
+        self.sort_combobox.grid(row=0, column=14, padx=(0, 0))
+        self.sort_combobox.bind("<<ComboboxSelected>>", lambda e: self.change_sort_metric())
+        self.sort_combobox.set(self.sort_choice.get())
         
         # Content frame
         content_frame = ttk.Frame(main_frame)
@@ -173,52 +191,17 @@ class DataViewer:
     def apply_search(self):
         search_text = self.search_var.get().strip().lower()
         self.current_search = search_text
-        base_data = self.flips_only_data if self.show_flips_only.get() else self.all_data
-        if search_text:
-            if self.id_only_var.get():
-                # Search only in id (or id field)
-                self.filtered_data = [entry for entry in base_data if search_text in str(entry.get('id', '')).lower()]
-            else:
-                self.filtered_data = [entry for entry in base_data if search_text in json.dumps(entry, ensure_ascii=False).lower()]
-        else:
-            self.filtered_data = base_data.copy()
-        self.data = self.filtered_data
-        self.current_index = 0
-        if not self.data:
-            self.counter_var.set("0 / 0")
-            self.update_display()
+        if not self.rebuild_active_data():
             messagebox.showinfo("No Results", "No entries match your search.")
-        else:
-            self.update_display()
 
     def clear_search(self):
         self.search_var.set("")
         self.current_search = ""
-        base_data = self.flips_only_data if self.show_flips_only.get() else self.all_data
-        self.filtered_data = base_data.copy()
-        self.data = self.filtered_data
-        self.current_index = 0
-        self.update_display()
+        self.rebuild_active_data()
 
     def toggle_flips_mode(self):
-        # Switch between flips-only and all data, and re-apply search if needed
-        base_data = self.flips_only_data if self.show_flips_only.get() else self.all_data
-        if self.current_search:
-            search_text = self.current_search
-            if self.id_only_var.get():
-                self.filtered_data = [entry for entry in base_data if search_text in str(entry.get('id', '')).lower()]
-            else:
-                self.filtered_data = [entry for entry in base_data if search_text in json.dumps(entry, ensure_ascii=False).lower()]
-        else:
-            self.filtered_data = base_data.copy()
-        self.data = self.filtered_data
-        self.current_index = 0
-        if not self.data:
-            self.counter_var.set("0 / 0")
-            self.update_display()
+        if not self.rebuild_active_data():
             messagebox.showerror("Error", "No entries to display in this mode.")
-        else:
-            self.update_display()
             
     def load_file(self, file_path):
         try:
@@ -253,31 +236,13 @@ class DataViewer:
                 actual = ct.get('decoded_value')
                 if pred is not None and actual is not None and str(pred) != str(actual):
                     self.flips_only_data.append(entry)
-            # Sort both lists by worst_loss descending (now under loss_metrics)
-            def _worst_loss_key(x):
-                return (x.get('loss_metrics') or {}).get('worst_loss', 0)
-            self.all_data.sort(key=_worst_loss_key, reverse=True)
-            self.flips_only_data.sort(key=_worst_loss_key, reverse=True)
-            # Set data based on checkbox and search
-            base_data = self.flips_only_data if self.show_flips_only.get() else self.all_data
-            if self.current_search:
-                search_text = self.current_search
-                if self.id_only_var.get():
-                    self.filtered_data = [entry for entry in base_data if search_text in str(entry.get('id', '')).lower()]
-                else:
-                    self.filtered_data = [entry for entry in base_data if search_text in json.dumps(entry, ensure_ascii=False).lower()]
-            else:
-                self.filtered_data = base_data.copy()
-            self.data = self.filtered_data
-            if not self.data:
+            self.sort_data()
+            self.file_path_var.set(file_path)
+            if not self.rebuild_active_data():
                 messagebox.showerror("Error", "No valid entries found in file (after filtering)")
                 return
-            self.file_path_var.set(file_path)
-            self.current_index = 0
-            self.update_display()
-            self.prev_btn.config(state="normal")
-            self.next_btn.config(state="normal")
-            messagebox.showinfo("Success", f"Loaded {len(self.all_data)} unique id entries ({len(self.flips_only_data)} flips, sorted by worst_loss)")
+            metric_label = self.get_sort_label()
+            messagebox.showinfo("Success", f"Loaded {len(self.all_data)} unique id entries ({len(self.flips_only_data)} flips, sorted by {metric_label})")
         except Exception as e:
             messagebox.showerror("Error", f"Failed to load file: {e}")
             
@@ -333,6 +298,14 @@ class DataViewer:
                 info_parts.append(f"Target: {target_str}")
         if 'stat' in entry:
             info_parts.append(f"Stat: {entry['stat']}")
+        metric_key = self.get_sort_metric()
+        metric_label = self.get_sort_label()
+        metric_value = self._get_loss_metric_value(entry, metric_key)
+        if metric_value is not None:
+            if isinstance(metric_value, float):
+                info_parts.append(f"{metric_label}: {metric_value:.6f}")
+            else:
+                info_parts.append(f"{metric_label}: {metric_value}")
         self.info_var.set(" | ".join(info_parts))
         
         # Update prompt with highlighting
@@ -444,6 +417,83 @@ class DataViewer:
             metadata_lines.append(json.dumps(entry['new_state'], indent=2))
             
         self.metadata_text.insert(tk.END, "\n".join(metadata_lines))
+
+    def get_sort_metric(self):
+        return self.metric_keys_by_label.get(self.sort_choice.get(), "worst_loss")
+
+    def get_sort_label(self):
+        metric = self.get_sort_metric()
+        return self.metric_labels.get(metric, metric)
+
+    def _get_loss_metric_value(self, entry, metric):
+        if not isinstance(entry, dict):
+            return None
+        metrics = entry.get('loss_metrics')
+        if not isinstance(metrics, dict):
+            return None
+        return metrics.get(metric)
+
+    def _metric_sort_value(self, entry, metric):
+        value = self._get_loss_metric_value(entry, metric)
+        if isinstance(value, (int, float)):
+            return value
+        if value is None:
+            return float('-inf')
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return float('-inf')
+
+    def sort_data(self):
+        metric = self.get_sort_metric()
+        self.all_data.sort(key=lambda x: self._metric_sort_value(x, metric), reverse=True)
+        self.flips_only_data.sort(key=lambda x: self._metric_sort_value(x, metric), reverse=True)
+
+    def rebuild_active_data(self, reset_index=True):
+        base_data = self.flips_only_data if self.show_flips_only.get() else self.all_data
+        if self.current_search:
+            search_text = self.current_search
+            if self.id_only_var.get():
+                filtered = [entry for entry in base_data if search_text in str(entry.get('id', '')).lower()]
+            else:
+                filtered = [
+                    entry for entry in base_data
+                    if search_text in json.dumps(entry, ensure_ascii=False).lower()
+                ]
+        else:
+            filtered = base_data.copy()
+        self.filtered_data = filtered
+        self.data = filtered
+        if not self.data:
+            self.counter_var.set("0 / 0")
+            self.prev_btn.config(state="disabled")
+            self.next_btn.config(state="disabled")
+            self.update_display()
+            return False
+        if reset_index:
+            self.current_index = 0
+        else:
+            self.current_index = min(self.current_index, len(self.data) - 1)
+        self.update_display()
+        return True
+
+    def change_sort_metric(self, *_):
+        if not self.all_data and not self.flips_only_data:
+            return
+        current_id = None
+        if self.data and 0 <= self.current_index < len(self.data):
+            current_entry = self.data[self.current_index]
+            if isinstance(current_entry, dict):
+                current_id = current_entry.get('id')
+        self.sort_data()
+        if not self.rebuild_active_data():
+            return
+        if current_id is not None:
+            for idx, entry in enumerate(self.data):
+                if isinstance(entry, dict) and entry.get('id') == current_id:
+                    self.current_index = idx
+                    self.update_display()
+                    break
 
     def print_flips_per_source_file(self):
         # Count flips per source file (first part of id before ':')
