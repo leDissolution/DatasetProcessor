@@ -11,6 +11,7 @@ CLI options:
     --with_stage3 / --no-with_stage3
                                                      Write Stage3 outputs (default: False).
     --exclude_top_percentile X Exclude the top X percent most difficult entries (default: 0).
+    --existing_eval_file PATH Reuse an existing eval JSONL and filter its IDs from training (default: none).
     --big_eval_size N         If > 0, also assemble big_eval.jsonl of size N that includes
                               the regular eval, all synthetic eval entries, and fills the rest
                               50/50 from medium and low difficulty buckets. Big eval does not
@@ -488,6 +489,12 @@ def main():
         help="Exclude the top X percent of highest-difficulty entries from each training pool",
     )
     parser.add_argument(
+        "--existing_eval_file",
+        type=str,
+        default="",
+        help="Path (absolute or relative to Assembled/) of an eval JSONL to reuse",
+    )
+    parser.add_argument(
         "--train_file_name",
         type=str,
         default="train_high.jsonl",
@@ -513,6 +520,17 @@ def main():
     if args.with_stage3:
         ensure_directories(STAGE3_PATH)
     random.seed(RNG_SEED)
+
+    existing_eval_path: Optional[str] = None
+    if args.existing_eval_file:
+        candidate = args.existing_eval_file.strip()
+        if candidate:
+            if not os.path.isabs(candidate):
+                candidate = os.path.join(ASSEMBLED_PATH, candidate)
+            candidate = os.path.normpath(candidate)
+            if not os.path.isfile(candidate):
+                raise FileNotFoundError(f"Existing eval file not found: {candidate}")
+            existing_eval_path = candidate
 
     # Load data files
     train_files = get_files_by_suffix(CHATS_PATH, '.train.jsonl') if args.with_chats else []
@@ -554,23 +572,45 @@ def main():
                 f"Excluded {before_synth - len(synth_train)} entries from synthetic training pool (top {pct}% difficulty)"
             )
 
+    use_existing_eval = existing_eval_path is not None
+    if use_existing_eval:
+        existing_eval_entries = load_jsonl_files([existing_eval_path])
+        filtered_existing_eval = filter_entries_by_attr(existing_eval_entries)
+        removed_from_existing = len(existing_eval_entries) - len(filtered_existing_eval)
+        if removed_from_existing > 0:
+            print(
+                f"[INFO] Excluded {removed_from_existing} entries from existing eval due to attribute predicate"
+            )
+        eval_data = filtered_existing_eval
+        print(f"Reusing {len(eval_data)} eval entries from {existing_eval_path}")
+
     high_loss, medium_loss, low_loss, zero_loss = create_loss_buckets(train)
 
-    eval_data = [entry for entry in eval_data if get_completion_difficulty(entry) >= REPLACE_EVAL_THRESHOLD]
-    existing_eval_ids = get_eval_ids(eval_data)
+    if not use_existing_eval:
+        eval_data = [
+            entry for entry in eval_data if get_completion_difficulty(entry) >= REPLACE_EVAL_THRESHOLD
+        ]
+        existing_eval_ids = get_eval_ids(eval_data)
 
-    #eval_count = (len(eval_data) // EVAL_BATCH_SIZE + EXTRA_EVAL_BATCHES) * EVAL_BATCH_SIZE - len(eval_data)
-    eval_count = max(0, EVAL_BATCHES * EVAL_BATCH_SIZE - len(eval_data))
-    print(f"Adding {eval_count} entries to eval set")
+        #eval_count = (len(eval_data) // EVAL_BATCH_SIZE + EXTRA_EVAL_BATCHES) * EVAL_BATCH_SIZE - len(eval_data)
+        eval_count = max(0, EVAL_BATCHES * EVAL_BATCH_SIZE - len(eval_data))
+        print(f"Adding {eval_count} entries to eval set")
 
-    # Select unique id entries from medium_loss
-    unique_medium_entries = select_unique_source_entries(medium_loss, eval_count, existing_eval_ids)
-    eval_data += unique_medium_entries
+        # Select unique id entries from medium_loss
+        unique_medium_entries = select_unique_source_entries(
+            medium_loss, eval_count, existing_eval_ids
+        )
+        eval_data += unique_medium_entries
 
-    print(f"Successfully added {len(unique_medium_entries)} unique entries from medium_loss to eval set")
+        print(
+            f"Successfully added {len(unique_medium_entries)} unique entries from medium_loss to eval set"
+        )
 
     eval_ids = get_eval_ids(eval_data)
-    print(f"Found {len(eval_ids)} unique ids in eval set")
+    if use_existing_eval:
+        print(f"Found {len(eval_ids)} unique ids in reused eval set")
+    else:
+        print(f"Found {len(eval_ids)} unique ids in eval set")
 
     original_train_count = len(train)
     train = remove_eval_contamination(train, eval_ids)
