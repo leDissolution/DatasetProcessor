@@ -782,7 +782,7 @@ def main():
 
     print_bucket_stats(high_loss, medium_loss, low_loss, zero_loss, synth_train, train)
 
-    train += high_loss * 3 + medium_loss * 2
+    train += high_loss * 3 + medium_loss
 
     # Create Stage 2 dataset (high-quality subset)
     count = REQUIRED_COUNT - len(synth_train)
