@@ -35,15 +35,15 @@ BASE_PATH = r".\Dataset\Prepared_st2\\"
 # The concrete paths are derived in main() to allow --base_path override.
 
 BATCH_SIZE = 24
-REQUIRED_COUNT = 1400 * BATCH_SIZE
-REGULARIZATION_COUNT = 600 * BATCH_SIZE
+REQUIRED_COUNT = 800 * BATCH_SIZE
+REGULARIZATION_COUNT = 200 * BATCH_SIZE
 
 EVAL_BATCH_SIZE = 18
 EVAL_BATCHES = 30
 REPLACE_EVAL_THRESHOLD = 0.05
 
 HIGH_LOSS_THRESHOLD = 3
-MEDIUM_LOSS_MIN = 0.5
+MEDIUM_LOSS_MIN = 1
 LOW_LOSS_MIN = 0.0
 
 # Deterministic RNG seed for stable shuffles across runs
@@ -180,13 +180,19 @@ def print_bucket_stats(high_loss: List, medium_loss: List, low_loss: List,
     low_flips = count_flips(low_loss)
     zero_flips = count_flips(zero_loss)
     synth_flips = count_flips(synth_train)
+    high_no_change = count_no_change(high_loss)
+    medium_no_change = count_no_change(medium_loss)
+    low_no_change = count_no_change(low_loss)
+    zero_no_change = count_no_change(zero_loss)
+    synth_no_change = count_no_change(synth_train)
+    train_no_change = count_no_change(train)
 
-    print(f"High loss: {len(high_loss)} (flips: {high_flips})")
-    print(f"Medium loss: {len(medium_loss)} (flips: {medium_flips})")
-    print(f"Low loss: {len(low_loss)} (flips: {low_flips})")
-    print(f"Zero loss: {len(zero_loss)} (flips: {zero_flips})")
-    print(f"Synth train: {len(synth_train)} (flips: {synth_flips})")
-    print(f"Total: {len(train)}")
+    print(f"High loss: {len(high_loss)} (flips: {high_flips}, no_change: {high_no_change})")
+    print(f"Medium loss: {len(medium_loss)} (flips: {medium_flips}, no_change: {medium_no_change})")
+    print(f"Low loss: {len(low_loss)} (flips: {low_flips}, no_change: {low_no_change})")
+    print(f"Zero loss: {len(zero_loss)} (flips: {zero_flips}, no_change: {zero_no_change})")
+    print(f"Synth train: {len(synth_train)} (flips: {synth_flips}, no_change: {synth_no_change})")
+    print(f"Total: {len(train)} (no_change: {train_no_change})")
 
 
 def get_eval_ids(eval_entries: List[Dict[str, Any]]) -> Set[str]:
@@ -308,6 +314,16 @@ def is_flip(entry: Dict[str, Any]) -> bool:
 def count_flips(entries: List[Dict[str, Any]]) -> int:
     """Count the number of flips in a list of entries."""
     return sum(1 for entry in entries if is_flip(entry))
+
+
+def count_no_change(entries: List[Dict[str, Any]]) -> int:
+    """Count entries explicitly marked to keep the original value."""
+    sentinel = "!!no_change!!\" />"
+    return sum(
+        1
+        for entry in entries
+        if isinstance(entry.get('prompt'), str) and str(entry.get('prompt')).endswith(sentinel)
+    )
 
 
 def sort_by_flip_priority(entries: List[Dict[str, Any]], flips_first: bool = True) -> List[Dict[str, Any]]:
@@ -751,6 +767,7 @@ def main():
                 big_eval.extend(add_medium + add_low)
 
     eval_data = sorted(eval_data, key=lambda x: len(x.get('prompt', '')))
+    print(f"No-change entries in eval: {count_no_change(eval_data)}")
 
     synth_train = synth_train * 2
 
@@ -781,7 +798,7 @@ def main():
     train_remaining_flips_first = sort_by_flip_priority(train_remaining, flips_first=True)
 
     # For regularization, take from the end (non-flips prioritized)
-    train_remaining_nonflips_first = sort_by_flip_priority(train_remaining, flips_first=False)
+    train_remaining_nonflips_first = sort_by_flip_priority(train_remaining, flips_first=True)
     regularization_entries = train_remaining_nonflips_first[:REGULARIZATION_COUNT]
 
     train_high += regularization_entries
@@ -815,6 +832,7 @@ def main():
         print(f"{stat}: {len(entries)} (flips: {flip_count}, {pct:.1f}% pool, {pct_of_selected:.1f}% selected)")
 
     random.shuffle(train_high)
+    print(f"No-change entries in train_high: {count_no_change(train_high)}")
 
     # Write assembled datasets
     train_output_path = os.path.join(ASSEMBLED_PATH, args.train_file_name)
