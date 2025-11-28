@@ -122,6 +122,10 @@ class Datapoint:
     target: Optional["Target"] = None
     # Metadata: origin of the datapoint as "{filename}:{line}"
     source_id: str = ""
+    # Metadata: id of the datapoint for tracking variants as "{source_id}:{original_subject_id}:{attr}"
+    id: str = ""
+    # Metadata: captures the original subject identifier from the parsed entity
+    original_subject_id: Optional[str] = None
 
     loss_metrics: Optional["LossMetrics"] = None
 
@@ -130,6 +134,41 @@ class Datapoint:
             self.previous_state = EntityList(self.previous_state)
         if not isinstance(self.state, EntityList):
             self.state = EntityList(self.state)
+
+        if self.original_subject_id is None:
+            self.original_subject_id = self._infer_original_subject_id()
+
+        self._rebuild_id()
+
+    def _infer_original_subject_id(self) -> Optional[str]:
+        # Prefer the targeted entity first, then fall back to the parsed state entities.
+        if self.target and self.target.subject_id:
+            return self.target.subject_id
+
+        for collection in (self.state, self.previous_state, self.state_context):
+            for ent in collection:
+                subj = getattr(ent, "subject", None)
+                sid = getattr(subj, "id", None)
+                if isinstance(sid, str) and sid:
+                    return sid
+        return None
+
+    def _rebuild_id(self) -> None:
+        parts: List[str] = []
+        if self.source_id:
+            parts.append(self.source_id)
+
+        subject_part: Optional[str] = self.original_subject_id or (
+            self.target.subject_id if (self.target and self.target.subject_id) else None
+        )
+        if subject_part:
+            parts.append(str(subject_part))
+
+        attr_part: Optional[str] = self.target.attr if (self.target and self.target.attr) else None
+        if attr_part:
+            parts.append(str(attr_part))
+
+        self.id = ":".join(parts)
 
     def all_entities(self) -> EntityList[Entity]:
         """Return all entities including anchors in order: prevMsg, prev_state..., msg, state..."""
@@ -172,20 +211,20 @@ class Datapoint:
         if (self.target and expected_value == "!!no_change!!"):
             expected_value = self.previous_state.target_value(self.target, default=expected_value)
 
-        id = self.source_id
-        if self.target and self.target.subject_id:
-            id += f":{self.target.subject_id}"
-        if self.target and self.target.attr:
-            id += f":{self.target.attr}"
+        # Ensure the identifier reflects the original subject, even after downstream augmentation.
+        self._rebuild_id()
+        id_value = self.id
 
         out: Dict[str, Any] = {
             "prompt": prompt,
-            "id": id,
+            "id": id_value,
             "source_id": self.source_id,
             "target": target_json,
             "loss_metrics": loss_metrics_json,
             "expected_value": expected_value,
         }
+        if self.original_subject_id is not None:
+            out["original_subject_id"] = self.original_subject_id
         return out
 
     def to_raw_json(self) -> Dict[str, Any]:
@@ -232,6 +271,7 @@ class Datapoint:
             "state": [_entity_to_json(e) for e in self.state],
             "target": _target_json(),
             "source_id": self.source_id,
+            "original_subject_id": self.original_subject_id,
         }
 
     def clone(self, **overrides: Any) -> "Datapoint":
@@ -249,6 +289,8 @@ class Datapoint:
             "state": EntityList(self.state),
             "target": self.target,
             "source_id": self.source_id,
+            "id": self.id,
+            "original_subject_id": self.original_subject_id,
             "loss_metrics": (
                 None
                 if self.loss_metrics is None
@@ -265,6 +307,12 @@ class Datapoint:
             ),
         }
         data.update(overrides)
+
+        if data.get("original_subject_id") is None:
+            target_override = data.get("target")
+            subj_id = getattr(target_override, "subject_id", None)
+            if isinstance(subj_id, str) and subj_id:
+                data["original_subject_id"] = subj_id
 
         if not isinstance(data.get("previous_state"), EntityList):
             data["previous_state"] = EntityList(data.get("previous_state") or [])

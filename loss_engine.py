@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from datapoint import Datapoint
 
-from typing import List, Dict, Tuple, Optional, Any, cast
+from typing import List, Dict, Tuple, Optional, Any, cast, Set
 import os
 import time
 from concurrent.futures import ProcessPoolExecutor, as_completed, wait, FIRST_COMPLETED
@@ -26,7 +26,9 @@ _EMPTY_CACHE_EVERY_N: int = max(0, int(os.getenv("LOSS_ENGINE_EMPTY_CACHE_EVERY"
 _tokenizer: Any = None
 _model: Any = None
 _device: Optional[str] = None
-_comma_id: Optional[int] = None
+_delimiter_ids: List[int] = []
+BLOCK_DELIMITER_STRINGS: List[str] = [",", ";", " (", "(", " {", "{", " [", "["]
+
 _cpu_tokenizer: Any = None  # CPU-side tokenizer for planning/scheduling
 _BATCH_COUNTER: int = 0
 
@@ -80,7 +82,7 @@ def _plan_token_batches(
 
 def _worker_init(device_id: int, model_name: str, dtype: torch.dtype) -> None:
     """Runs once per worker process. Loads tokenizer + model on the given GPU."""
-    global _tokenizer, _model, _device, _comma_id
+    global _tokenizer, _model, _device, _delimiter_ids
     if device_id >= 0:
         _device = f"cuda:{device_id}"
         torch.cuda.set_device(device_id)
@@ -120,7 +122,17 @@ def _worker_init(device_id: int, model_name: str, dtype: torch.dtype) -> None:
     if tok.pad_token_id is None:
         tok.pad_token = tok.eos_token
     _tokenizer = tok
-    _comma_id = _tokenizer.encode(",")[0]
+    delimiter_ids: List[int] = []
+    for delimiter in BLOCK_DELIMITER_STRINGS:
+        try:
+            encoded = _tokenizer.encode(delimiter, add_special_tokens=False)
+        except TypeError:
+            encoded = _tokenizer.encode(delimiter)
+        if encoded:
+            delimiter_ids.extend(int(tid) for tid in encoded)
+    # Deduplicate while preserving order
+    seen: Set[int] = set()
+    _delimiter_ids = [tid for tid in delimiter_ids if not (tid in seen or seen.add(tid))]
 
     if device_id >= 0:
         _model = AutoModelForCausalLM.from_pretrained(
@@ -171,10 +183,142 @@ def _build_prefix(prompt: str, attr: Optional[str]) -> str:
     return prompt
 
 
+def _difficulty_metrics_from_logits(logits: torch.Tensor, labels: torch.Tensor) -> List[Dict[str, Any]]:
+    """Derive difficulty metrics for each sequence using the raw logits and prepared labels."""
+    assert _tokenizer is not None and bool(_delimiter_ids)
+
+    shift_logits = logits[..., :-1, :].contiguous()
+    shift_labels = labels[..., 1:].contiguous()
+
+    loss_fct = torch.nn.CrossEntropyLoss(reduction="none", ignore_index=-100)
+    loss_tok = loss_fct(
+        shift_logits.float().view(-1, shift_logits.size(-1)),
+        shift_labels.view(-1),
+    ).view(shift_labels.size())
+
+    mask_bool = shift_labels != -100
+    mask = mask_bool.float()
+    mean_loss = (loss_tok * mask).sum(1) / mask.sum(1).clamp(min=1)
+
+    is_delimiter = torch.zeros_like(mask_bool)
+    for delim_id in _delimiter_ids:
+        is_delimiter |= shift_labels == delim_id
+    is_delimiter &= mask_bool
+
+    masked_loss = loss_tok.masked_fill(mask == 0, float("-inf"))
+    worst_loss = masked_loss.max(1).values
+
+    # Curriculum-style difficulty derived from margin + switch-point weighting
+    probs = torch.softmax(shift_logits, dim=-1)
+    safe_labels = shift_labels.clone()
+    safe_labels = safe_labels.masked_fill(~mask_bool, 0)
+
+    true_token_probs = probs.gather(-1, safe_labels.unsqueeze(-1)).squeeze(-1)
+    true_token_probs = torch.where(mask_bool, true_token_probs, torch.zeros_like(true_token_probs))
+
+    top_k = 2 if probs.size(-1) >= 2 else 1
+    top_probs, top_indices = probs.topk(top_k, dim=-1)
+    top1_probs = top_probs[..., 0]
+    top1_indices = top_indices[..., 0]
+    runner_up_probs = top_probs[..., 1] if top_k > 1 else torch.zeros_like(top1_probs)
+
+    is_correct_prediction = top1_indices.eq(safe_labels)
+    best_wrong_prob = torch.where(is_correct_prediction, runner_up_probs, top1_probs)
+    best_wrong_prob = torch.where(mask_bool, best_wrong_prob, torch.zeros_like(best_wrong_prob))
+
+    margin = true_token_probs - best_wrong_prob
+    instructional_value = 1.0 - margin
+
+    is_switch_point = torch.zeros_like(mask_bool)
+    first_unmasked = (mask_bool.to(torch.long).cumsum(dim=1) == 1) & mask_bool
+    is_switch_point |= first_unmasked
+    is_switch_point[:, 1:] |= is_delimiter[:, :-1]
+
+    weights = torch.full_like(instructional_value, 0.5)
+    weights[is_switch_point] = 1.0
+
+    base_scores = instructional_value * weights
+    weighted_scores = base_scores * mask
+
+    sum_scores = weighted_scores.sum(1)
+    sum_weights = (weights * mask).sum(1).clamp(min=1)
+    mean_score = sum_scores / sum_weights
+
+    neg_inf = torch.full_like(base_scores, float("-inf"))
+    switch_scores = torch.where(is_switch_point & mask_bool, base_scores, neg_inf)
+    max_switch_score = switch_scores.max(1).values.clamp(max=10)
+    max_switch_score = torch.nan_to_num(max_switch_score, nan=0.0, neginf=0.0)
+
+    curriculum_difficulty = (0.5 * mean_score + 0.5 * max_switch_score)
+
+    critical_token_positions = masked_loss.argmax(dim=1)
+    critical_tokens: List[Dict[str, Any]] = []
+    valid_token_ids: List[int] = []
+    valid_indices: List[int] = []
+    pred_token_ids: List[int] = []
+    pred_valid_indices: List[int] = []
+
+    for i, pos in enumerate(critical_token_positions):
+        if mask[i, pos] > 0:
+            token_id = int(shift_labels[i, pos].item())
+            pred_token_id = int(shift_logits[i, pos].argmax().item())
+            valid_token_ids.append(token_id)
+            valid_indices.append(i)
+            pred_token_ids.append(pred_token_id)
+            pred_valid_indices.append(i)
+            critical_tokens.append({
+                "position": int(pos.item()),
+                "token_id": token_id,
+                "decoded_value": None,
+                "loss": float(loss_tok[i, pos].item()),
+                "pred_token_id": pred_token_id,
+                "pred_decoded_value": None,
+            })
+        else:
+            critical_tokens.append({
+                "position": -1,
+                "token_id": -1,
+                "decoded_value": "",
+                "loss": 0.0,
+                "pred_token_id": -1,
+                "pred_decoded_value": "",
+            })
+
+    if valid_token_ids:
+        try:
+            decoded_tokens = [_tokenizer.decode([tid], skip_special_tokens=False) for tid in valid_token_ids]  # type: ignore[arg-type]
+        except Exception:
+            decoded_tokens = [f"<token_{tid}>" for tid in valid_token_ids]
+        for valid_idx, decoded_token in zip(valid_indices, decoded_tokens):
+            critical_tokens[valid_idx]["decoded_value"] = decoded_token
+
+    if pred_token_ids:
+        try:
+            pred_decoded_tokens = [_tokenizer.decode([tid], skip_special_tokens=False) for tid in pred_token_ids]  # type: ignore[arg-type]
+        except Exception:
+            pred_decoded_tokens = [f"<token_{tid}>" for tid in pred_token_ids]
+        for pred_idx, pred_decoded_token in zip(pred_valid_indices, pred_decoded_tokens):
+            critical_tokens[pred_idx]["pred_decoded_value"] = pred_decoded_token
+
+    valid_counts = mask.sum(1)
+    mean_loss = torch.nan_to_num(mean_loss, nan=0.0, posinf=1e3, neginf=0.0)
+    worst_loss = torch.where(valid_counts > 0, torch.nan_to_num(worst_loss, nan=0.0, posinf=1e3, neginf=0.0), torch.zeros_like(worst_loss))
+
+    out: List[Dict[str, Any]] = []
+    for d, m, w, c in zip(curriculum_difficulty.tolist(), mean_loss.tolist(), worst_loss.tolist(), critical_tokens):
+        out.append({
+            "completion_difficulty": float(d),
+            "mean_loss": float(m),
+            "worst_loss": float(w),
+            "critical_token": c,
+        })
+
+    return out
+
 def _process_batch(batch: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """Compute loss metrics for a batch of items."""
     assert _tokenizer is not None and _model is not None and _device is not None
-    assert _comma_id is not None
+    assert _delimiter_ids
 
     try:
         # Predeclare for safe cleanup in error/early-return paths
@@ -286,94 +430,7 @@ def _process_batch(batch: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         with torch.inference_mode():
             logits = _model(**inputs, use_cache=False).logits
 
-        # Loss
-        shift_logits = logits[..., :-1, :].contiguous()
-        shift_labels = labels[..., 1:].contiguous()
-
-        loss_fct = torch.nn.CrossEntropyLoss(reduction="none", ignore_index=-100)
-        loss_tok = loss_fct(
-            shift_logits.float().view(-1, shift_logits.size(-1)),
-            shift_labels.view(-1),
-        ).view(shift_labels.size())
-
-        mask = (shift_labels != -100).float()
-        mean_loss = (loss_tok * mask).sum(1) / mask.sum(1).clamp(min=1)
-
-        is_comma = ((shift_labels == _comma_id) & (mask.bool()))
-        first_pos = torch.zeros_like(mask, dtype=torch.bool)
-        first_pos[:, 0] = mask[:, 0].bool()
-        first_pos[:, 1:] |= is_comma[:, :-1]
-
-        masked_loss = loss_tok.masked_fill(mask == 0, float("-inf"))
-        worst_loss = masked_loss.max(1).values
-
-        bf_scores = loss_tok.masked_fill((~first_pos) | (mask == 0), float("-inf"))
-        block_first_loss = bf_scores.max(1).values
-
-        critical_token_positions = masked_loss.argmax(dim=1)
-        critical_tokens: List[Dict[str, Any]] = []
-        valid_token_ids: List[int] = []
-        valid_indices: List[int] = []
-        pred_token_ids: List[int] = []
-        pred_valid_indices: List[int] = []
-
-        for i, pos in enumerate(critical_token_positions):
-            if mask[i, pos] > 0:
-                token_id = shift_labels[i, pos].item()
-                pred_token_id = shift_logits[i, pos].argmax().item()
-                valid_token_ids.append(token_id)
-                valid_indices.append(i)
-                pred_token_ids.append(pred_token_id)
-                pred_valid_indices.append(i)
-                critical_tokens.append({
-                    "position": int(pos.item()),
-                    "token_id": int(token_id),
-                    "decoded_value": None,
-                    "loss": float(loss_tok[i, pos].item()),
-                    "pred_token_id": int(pred_token_id),
-                    "pred_decoded_value": None,
-                })
-            else:
-                critical_tokens.append({
-                    "position": -1,
-                    "token_id": -1,
-                    "decoded_value": "",
-                    "loss": 0.0,
-                    "pred_token_id": -1,
-                    "pred_decoded_value": "",
-                })
-
-        if valid_token_ids:
-            try:
-                decoded_tokens = [_tokenizer.decode([tid], skip_special_tokens=False) for tid in valid_token_ids]  # type: ignore[arg-type]
-            except Exception:
-                decoded_tokens = [f"<token_{tid}>" for tid in valid_token_ids]
-            for valid_idx, decoded_token in zip(valid_indices, decoded_tokens):
-                critical_tokens[valid_idx]["decoded_value"] = decoded_token
-
-        if pred_token_ids:
-            try:
-                pred_decoded_tokens = [_tokenizer.decode([tid], skip_special_tokens=False) for tid in pred_token_ids]  # type: ignore[arg-type]
-            except Exception:
-                pred_decoded_tokens = [f"<token_{tid}>" for tid in pred_token_ids]
-            for pred_idx, pred_decoded_token in zip(pred_valid_indices, pred_decoded_tokens):
-                critical_tokens[pred_idx]["pred_decoded_value"] = pred_decoded_token
-
-        valid_counts = mask.sum(1)
-        mean_loss = torch.nan_to_num(mean_loss, nan=0.0, posinf=1e3, neginf=0.0)
-        worst_loss = torch.where(valid_counts > 0, torch.nan_to_num(worst_loss, nan=0.0, posinf=1e3, neginf=0.0), torch.zeros_like(worst_loss))
-        block_first_loss = torch.where(valid_counts > 0, torch.nan_to_num(block_first_loss, nan=0.0, posinf=1e3, neginf=0.0), torch.zeros_like(block_first_loss))
-
-        difficulty = (0.40 * mean_loss + 0.40 * block_first_loss + 0.20 * worst_loss).tolist()
-
-        out: List[Dict[str, Any]] = []
-        for d, m, w, c in zip(difficulty, mean_loss.tolist(), worst_loss.tolist(), critical_tokens):
-            out.append({
-                "completion_difficulty": float(d),
-                "mean_loss": float(m),
-                "worst_loss": float(w),
-                "critical_token": c,
-            })
+        out = _difficulty_metrics_from_logits(logits, labels)
 
         # Cleanup
         try:

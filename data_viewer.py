@@ -3,9 +3,17 @@
 JSONL Data Viewer - A simple GUI to browse through JSONL entries with critical token highlighting
 """
 import json
+import math
+import statistics
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox, scrolledtext
 import os
+
+try:
+    import numpy as np
+except Exception as e:
+    np = None
+    print(f"[WARNING] NumPy not available: {e}")
 
 # Hide console window on Windows
 if os.name == 'nt':
@@ -21,6 +29,13 @@ except Exception as e:
     tokenizer = None
     print(f"[WARNING] Could not load tokenizer: {e}")
 
+# --- Plotting setup ---
+try:
+    import matplotlib.pyplot as plt
+except Exception as e:
+    plt = None
+    print(f"[WARNING] Matplotlib not available: {e}")
+
 class DataViewer:
     def __init__(self, root):
         self.root = root
@@ -30,6 +45,9 @@ class DataViewer:
         self.data = []  # currently displayed data (filtered or not)
         self.all_data = []  # all loaded entries (unfiltered)
         self.flips_only_data = []  # only flips
+        self.entries_by_id = {}  # all versions grouped by id
+        self.natural_all_data = []  # original load order (all entries)
+        self.natural_flips_only_data = []  # original load order (flips only)
         self.current_index = 0
         self.show_flips_only = tk.BooleanVar(value=True)
         self.search_var = tk.StringVar()
@@ -38,9 +56,15 @@ class DataViewer:
         self.metric_labels = {
             "worst_loss": "Worst Loss",
             "completion_difficulty": "Completion Difficulty",
+            "natural_order": "Natural Order",
         }
         self.metric_keys_by_label = {label: key for key, label in self.metric_labels.items()}
         self.sort_choice = tk.StringVar(value=self.metric_labels["worst_loss"])
+        self.mislabel_fix_mode = tk.BooleanVar(value=False)
+        self.mislabel_threshold_var = tk.StringVar(value="8")
+        self.mislabel_threshold_value = 8.0
+        self.difficulty_variance_window = None
+        self.difficulty_variance_records = {}
         
         self.setup_ui()
         self.bind_keys()
@@ -65,58 +89,90 @@ class DataViewer:
         ttk.Entry(file_frame, textvariable=self.file_path_var, state="readonly", width=60).grid(row=0, column=1, padx=(0, 5))
         ttk.Button(file_frame, text="Browse", command=self.browse_file).grid(row=0, column=2)
         
-        # Navigation frame
+        # Navigation frame with compact rows
         nav_frame = ttk.Frame(main_frame)
         nav_frame.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(0, 10))
-        
-        self.prev_btn = ttk.Button(nav_frame, text="Previous", command=self.prev_entry, state="disabled")
+        nav_frame.columnconfigure(0, weight=1)
+
+        top_row = ttk.Frame(nav_frame)
+        top_row.grid(row=0, column=0, sticky="ew", pady=(0, 4))
+        top_row.columnconfigure(3, weight=1)
+
+        self.prev_btn = ttk.Button(top_row, text="Previous", command=self.prev_entry, state="disabled")
         self.prev_btn.grid(row=0, column=0, padx=(0, 5))
-        
-        self.next_btn = ttk.Button(nav_frame, text="Next", command=self.next_entry, state="disabled")
+
+        self.next_btn = ttk.Button(top_row, text="Next", command=self.next_entry, state="disabled")
         self.next_btn.grid(row=0, column=1, padx=(0, 10))
-        
+
         self.counter_var = tk.StringVar(value="0 / 0")
-        ttk.Label(nav_frame, textvariable=self.counter_var).grid(row=0, column=2, padx=(0, 10))
-        
-        ttk.Label(nav_frame, text="Go to:").grid(row=0, column=3, padx=(0, 5))
+        ttk.Label(top_row, textvariable=self.counter_var).grid(row=0, column=2)
+
+        ttk.Frame(top_row).grid(row=0, column=3, sticky="ew")  # spacer
+
+        ttk.Label(top_row, text="Go to:").grid(row=0, column=4, padx=(0, 5))
         self.jump_var = tk.StringVar()
-        jump_entry = ttk.Entry(nav_frame, textvariable=self.jump_var, width=10)
-        jump_entry.grid(row=0, column=4, padx=(0, 5))
+        jump_entry = ttk.Entry(top_row, textvariable=self.jump_var, width=8)
+        jump_entry.grid(row=0, column=5, padx=(0, 5))
         jump_entry.bind('<Return>', lambda e: self.jump_to_entry())
-        
-        ttk.Button(nav_frame, text="Jump", command=self.jump_to_entry).grid(row=0, column=5)
-        
-        # Flips-only checkbox (after nav frame)
-        self.flips_checkbox = ttk.Checkbutton(nav_frame, text="Show flips only", variable=self.show_flips_only, command=self.toggle_flips_mode)
-        self.flips_checkbox.grid(row=0, column=6, padx=(10, 0))
 
-        # Search field and buttons
-        ttk.Label(nav_frame, text="Search:").grid(row=0, column=7, padx=(10, 0))
-        search_entry = ttk.Entry(nav_frame, textvariable=self.search_var, width=20)
-        search_entry.grid(row=0, column=8, padx=(0, 5))
+        ttk.Button(top_row, text="Jump", command=self.jump_to_entry).grid(row=0, column=6)
+
+        mid_row = ttk.Frame(nav_frame)
+        mid_row.grid(row=1, column=0, sticky="ew", pady=(0, 4))
+        mid_row.columnconfigure(2, weight=1)
+
+        self.flips_checkbox = ttk.Checkbutton(mid_row, text="Show flips only", variable=self.show_flips_only, command=self.toggle_flips_mode)
+        self.flips_checkbox.grid(row=0, column=0, padx=(0, 15))
+
+        ttk.Label(mid_row, text="Search:").grid(row=0, column=1, padx=(0, 5))
+        search_entry = ttk.Entry(mid_row, textvariable=self.search_var)
+        search_entry.grid(row=0, column=2, padx=(0, 5), sticky="ew")
         search_entry.bind('<Return>', lambda e: self.apply_search())
-        ttk.Button(nav_frame, text="Go", command=self.apply_search).grid(row=0, column=9, padx=(0, 2))
-        ttk.Button(nav_frame, text="Clear", command=self.clear_search).grid(row=0, column=10)
-        
-        # ID-only search checkbox
-        self.id_only_var = tk.BooleanVar(value=False)
-        self.id_only_checkbox = ttk.Checkbutton(nav_frame, text="ID only", variable=self.id_only_var)
-        self.id_only_checkbox.grid(row=0, column=11, padx=(10, 0))
-        
-        # Button to print flips per source file
-        ttk.Button(nav_frame, text="Flips per Source File", command=self.print_flips_per_source_file).grid(row=0, column=12, padx=(10, 0))
 
-        ttk.Label(nav_frame, text="Sort by:").grid(row=0, column=13, padx=(10, 0))
+        ttk.Button(mid_row, text="Go", command=self.apply_search, width=5).grid(row=0, column=3, padx=(0, 2))
+        ttk.Button(mid_row, text="Clear", command=self.clear_search, width=6).grid(row=0, column=4, padx=(0, 8))
+
+        self.id_only_var = tk.BooleanVar(value=False)
+        self.id_only_checkbox = ttk.Checkbutton(mid_row, text="ID only", variable=self.id_only_var)
+        self.id_only_checkbox.grid(row=0, column=5)
+
+        bottom_row = ttk.Frame(nav_frame)
+        bottom_row.grid(row=2, column=0, sticky="ew")
+        bottom_row.columnconfigure(3, weight=1)
+
+        ttk.Label(bottom_row, text="Sort by:").grid(row=0, column=0, padx=(0, 5))
         self.sort_combobox = ttk.Combobox(
-            nav_frame,
+            bottom_row,
             textvariable=self.sort_choice,
             values=list(self.metric_labels.values()),
             state="readonly",
-            width=22,
+            width=18,
         )
-        self.sort_combobox.grid(row=0, column=14, padx=(0, 0))
+        self.sort_combobox.grid(row=0, column=1, padx=(0, 10))
         self.sort_combobox.bind("<<ComboboxSelected>>", lambda e: self.change_sort_metric())
         self.sort_combobox.set(self.sort_choice.get())
+
+        ttk.Button(bottom_row, text="Loss Histograms", command=self.show_loss_histograms).grid(row=0, column=2, padx=(0, 5))
+
+        ttk.Frame(bottom_row).grid(row=0, column=3, sticky="ew")  # spacer
+
+        ttk.Button(bottom_row, text="Flips per Source File", command=self.print_flips_per_source_file).grid(row=0, column=4, padx=(0, 10))
+
+        ttk.Button(bottom_row, text="Difficulty Variance", command=self.show_difficulty_variance).grid(row=0, column=5, padx=(0, 10))
+
+        self.mislabel_checkbutton = ttk.Checkbutton(
+            bottom_row,
+            text="Mislabel fix mode",
+            variable=self.mislabel_fix_mode,
+            command=self.toggle_mislabel_fix_mode,
+        )
+        self.mislabel_checkbutton.grid(row=0, column=6, padx=(0, 5))
+
+        ttk.Label(bottom_row, text="Threshold:").grid(row=0, column=7, padx=(0, 5))
+        self.mislabel_threshold_entry = ttk.Entry(bottom_row, textvariable=self.mislabel_threshold_var, width=6)
+        self.mislabel_threshold_entry.grid(row=0, column=8, padx=(0, 5))
+        self.mislabel_threshold_entry.bind('<Return>', lambda e: self.apply_mislabel_threshold())
+        ttk.Button(bottom_row, text="Apply", command=self.apply_mislabel_threshold).grid(row=0, column=9)
         
         # Content frame
         content_frame = ttk.Frame(main_frame)
@@ -202,11 +258,43 @@ class DataViewer:
     def toggle_flips_mode(self):
         if not self.rebuild_active_data():
             messagebox.showerror("Error", "No entries to display in this mode.")
+
+    def toggle_mislabel_fix_mode(self):
+        if self.mislabel_fix_mode.get():
+            self.flips_checkbox.state(['disabled'])
+            self.sort_combobox.config(state="disabled")
+            if not self.apply_mislabel_threshold():
+                self.mislabel_fix_mode.set(False)
+                self.flips_checkbox.state(['!disabled'])
+                self.sort_combobox.config(state="readonly")
+        else:
+            self.flips_checkbox.state(['!disabled'])
+            self.sort_combobox.config(state="readonly")
+            self.rebuild_active_data()
+
+    def apply_mislabel_threshold(self):
+        raw_value = self.mislabel_threshold_var.get().strip()
+        try:
+            value = float(raw_value)
+        except ValueError:
+            messagebox.showerror("Invalid Threshold", "Please enter a numeric worst_loss threshold.")
+            self.mislabel_threshold_var.set(f"{self.mislabel_threshold_value:g}")
+            return False
+
+        self.mislabel_threshold_value = value
+        self.mislabel_threshold_var.set(f"{value:g}")
+        if self.mislabel_fix_mode.get():
+            if not self.rebuild_active_data():
+                messagebox.showinfo("No Entries", "No datapoints exceed the current mislabel threshold.")
+        return True
             
     def load_file(self, file_path):
         try:
             self.all_data = []
+            self.entries_by_id = {}
             unique = {}
+            self.natural_all_data = []
+            self.natural_flips_only_data = []
             with open(file_path, 'r', encoding='utf-8') as f:
                 for line_num, line in enumerate(f, 1):
                     line = line.strip()
@@ -216,6 +304,7 @@ class DataViewer:
                             # Use id as unique key
                             key = entry.get('id', None)
                             if key is not None:
+                                self.entries_by_id.setdefault(key, []).append(entry)
                                 # Keep only the entry with the highest worst_loss for each id (now under loss_metrics)
                                 def _worst(e):
                                     return (e.get('loss_metrics') or {}).get('worst_loss', 0)
@@ -236,6 +325,8 @@ class DataViewer:
                 actual = ct.get('decoded_value')
                 if pred is not None and actual is not None and str(pred) != str(actual):
                     self.flips_only_data.append(entry)
+            self.natural_all_data = list(self.all_data)
+            self.natural_flips_only_data = list(self.flips_only_data)
             self.sort_data()
             self.file_path_var.set(file_path)
             if not self.rebuild_active_data():
@@ -444,13 +535,46 @@ class DataViewer:
         except (TypeError, ValueError):
             return float('-inf')
 
+    def _get_source_id(self, entry):
+        if not isinstance(entry, dict):
+            return ""
+        raw_id = entry.get('id')
+        if raw_id is None:
+            return ""
+        raw_id = str(raw_id)
+        if ':' in raw_id:
+            return raw_id.split(':', 1)[0]
+        return raw_id
+
+    def _passes_mislabel_threshold(self, entry):
+        metric_value = self._get_loss_metric_value(entry, "worst_loss")
+        if metric_value is None:
+            return False
+        try:
+            return float(metric_value) > self.mislabel_threshold_value
+        except (TypeError, ValueError):
+            return False
+
+    def _mislabel_sort_key(self, entry):
+        source_id = self._get_source_id(entry).lower()
+        worst_loss = self._metric_sort_value(entry, "worst_loss")
+        return (source_id, -worst_loss, str(entry.get('id', '')))
+
     def sort_data(self):
         metric = self.get_sort_metric()
+        if metric == "natural_order":
+            self.all_data = list(self.natural_all_data)
+            self.flips_only_data = list(self.natural_flips_only_data)
+            return
         self.all_data.sort(key=lambda x: self._metric_sort_value(x, metric), reverse=True)
         self.flips_only_data.sort(key=lambda x: self._metric_sort_value(x, metric), reverse=True)
 
     def rebuild_active_data(self, reset_index=True):
-        base_data = self.flips_only_data if self.show_flips_only.get() else self.all_data
+        if self.mislabel_fix_mode.get():
+            base_data = [entry for entry in self.all_data if self._passes_mislabel_threshold(entry)]
+            base_data.sort(key=self._mislabel_sort_key)
+        else:
+            base_data = self.flips_only_data if self.show_flips_only.get() else self.all_data
         if self.current_search:
             search_text = self.current_search
             if self.id_only_var.get():
@@ -461,7 +585,7 @@ class DataViewer:
                     if search_text in json.dumps(entry, ensure_ascii=False).lower()
                 ]
         else:
-            filtered = base_data.copy()
+            filtered = list(base_data)
         self.filtered_data = filtered
         self.data = filtered
         if not self.data:
@@ -510,6 +634,301 @@ class DataViewer:
         for source_file, count in counter.most_common():
             print(f"{source_file}: {count}")
         messagebox.showinfo("Flips per Source File", "Printed to console.")
+
+    def show_difficulty_variance(self):
+        if not self.entries_by_id:
+            messagebox.showinfo("No Data", "Load a dataset before calculating difficulty variance.")
+            return
+
+        metric = "completion_difficulty"
+        results = {}
+        for id_value, variants in self.entries_by_id.items():
+            numeric_values = []
+            for entry in variants:
+                value = self._get_loss_metric_value(entry, metric)
+                if value is None:
+                    continue
+                try:
+                    numeric_value = float(value)
+                except (TypeError, ValueError):
+                    continue
+                if math.isfinite(numeric_value):
+                    numeric_values.append(numeric_value)
+            if len(numeric_values) < 2:
+                continue
+            mean_value = statistics.mean(numeric_values)
+            try:
+                variance_value = statistics.variance(numeric_values)
+            except statistics.StatisticsError:
+                variance_value = 0.0
+            std_dev_value = math.sqrt(variance_value) if variance_value >= 0 else float('nan')
+            results[id_value] = {
+                "count": len(numeric_values),
+                "mean": mean_value,
+                "variance": variance_value,
+                "std_dev": std_dev_value,
+                "min": min(numeric_values),
+                "max": max(numeric_values),
+                "range": max(numeric_values) - min(numeric_values),
+                "values": numeric_values,
+                "variants": variants,
+            }
+
+        if not results:
+            messagebox.showinfo("No Variance", "No ids have multiple numeric completion_difficulty values.")
+            return
+
+        sorted_items = sorted(results.items(), key=lambda item: item[1]["variance"], reverse=True)
+        self.difficulty_variance_records = results
+
+        window_ref = self.difficulty_variance_window
+        if window_ref is not None and window_ref.winfo_exists():
+            window_ref.destroy()
+        self.difficulty_variance_window = None
+
+        window = tk.Toplevel(self.root)
+        window.title("Difficulty Variance by ID")
+        window.geometry("900x500")
+        self.difficulty_variance_window = window
+        window.protocol("WM_DELETE_WINDOW", lambda w=window: self._close_difficulty_variance_window(w))
+
+        columns = ("id", "versions", "min", "max", "mean", "variance", "std_dev", "range")
+        tree = ttk.Treeview(window, columns=columns, show="headings")
+        tree.heading("id", text="ID")
+        tree.heading("versions", text="Versions")
+        tree.heading("min", text="Min")
+        tree.heading("max", text="Max")
+        tree.heading("mean", text="Mean")
+        tree.heading("variance", text="Variance")
+        tree.heading("std_dev", text="Std Dev")
+        tree.heading("range", text="Range")
+
+        tree.column("id", width=240, anchor="w")
+        tree.column("versions", width=80, anchor="center")
+        tree.column("min", width=100, anchor="e")
+        tree.column("max", width=100, anchor="e")
+        tree.column("mean", width=100, anchor="e")
+        tree.column("variance", width=120, anchor="e")
+        tree.column("std_dev", width=120, anchor="e")
+        tree.column("range", width=100, anchor="e")
+
+        scrollbar = ttk.Scrollbar(window, orient="vertical", command=tree.yview)
+        tree.configure(yscrollcommand=scrollbar.set)
+
+        tree.grid(row=0, column=0, sticky="nsew")
+        scrollbar.grid(row=0, column=1, sticky="ns")
+
+        window.columnconfigure(0, weight=1)
+        window.rowconfigure(0, weight=1)
+
+        for id_value, metrics in sorted_items:
+            tree.insert(
+                "",
+                tk.END,
+                values=(
+                    id_value,
+                    metrics["count"],
+                    f"{metrics['min']:.6f}",
+                    f"{metrics['max']:.6f}",
+                    f"{metrics['mean']:.6f}",
+                    f"{metrics['variance']:.6f}",
+                    f"{metrics['std_dev']:.6f}",
+                    f"{metrics['range']:.6f}",
+                ),
+            )
+
+        tree.bind("<Double-1>", self.show_difficulty_variance_details)
+
+        ttk.Label(
+            window,
+            text="Double-click a row to inspect all versions for that id.",
+            anchor="w"
+        ).grid(row=1, column=0, columnspan=2, sticky="ew", padx=5, pady=5)
+
+    def show_difficulty_variance_details(self, event):
+        tree_widget = event.widget
+        item_id = tree_widget.identify_row(event.y)
+        if not item_id:
+            return
+
+        item = tree_widget.item(item_id)
+        values = item.get("values", [])
+        if not values:
+            return
+        id_value = values[0]
+
+        # Ensure the row stays selected when the detail window opens
+        tree_widget.selection_set(item_id)
+        tree_widget.focus(item_id)
+
+        record = self.difficulty_variance_records.get(id_value)
+        if not record:
+            return
+
+        detail_window = tk.Toplevel(self.root)
+        detail_window.title(f"Versions for {id_value}")
+        detail_window.geometry("900x600")
+
+        text_widget = scrolledtext.ScrolledText(detail_window, wrap=tk.WORD)
+        text_widget.pack(fill=tk.BOTH, expand=True)
+
+        text_widget.insert(tk.END, f"ID: {id_value}\n")
+        text_widget.insert(tk.END, f"Versions with numeric completion_difficulty: {record['count']}\n")
+        text_widget.insert(tk.END, f"Mean: {record['mean']:.6f}, Variance: {record['variance']:.6f}, Std Dev: {record['std_dev']:.6f}, Range: {record['range']:.6f}\n\n")
+        numeric_values_line = ", ".join(f"{value:.6f}" for value in record["values"])
+        text_widget.insert(tk.END, f"Values: {numeric_values_line}\n\n")
+
+        for idx, variant in enumerate(record["variants"], 1):
+            difficulty = self._get_loss_metric_value(variant, "completion_difficulty")
+            worst_loss = self._get_loss_metric_value(variant, "worst_loss")
+            text_widget.insert(
+                tk.END,
+                f"Version {idx}: completion_difficulty={difficulty}, worst_loss={worst_loss}\n"
+            )
+            try:
+                serialized = json.dumps(variant, indent=2, ensure_ascii=False)
+            except (TypeError, ValueError):
+                serialized = str(variant)
+            text_widget.insert(tk.END, serialized + "\n\n")
+
+        text_widget.config(state=tk.DISABLED)
+
+    def _close_difficulty_variance_window(self, window):
+        window.destroy()
+        if getattr(self, "difficulty_variance_window", None) is window:
+            self.difficulty_variance_window = None
+
+    def show_loss_histograms(self):
+        if plt is None:
+            messagebox.showerror("Matplotlib Required", "Matplotlib is not available. Install it to view histograms.")
+            return
+        if np is None:
+            messagebox.showerror("NumPy Required", "NumPy is not available. Install it to view histograms.")
+            return
+        if not self.all_data:
+            messagebox.showerror("No Data", "Load a dataset before viewing histograms.")
+            return
+
+        metric_specs = [
+            ("worst_loss", self.metric_labels.get("worst_loss", "Worst Loss")),
+            ("completion_difficulty", self.metric_labels.get("completion_difficulty", "Completion Difficulty")),
+        ]
+
+        plot_data = []
+        for key, label in metric_specs:
+            values = []
+            for entry in self.all_data:
+                value = self._get_loss_metric_value(entry, key)
+                if value is None:
+                    continue
+                try:
+                    numeric = float(value)
+                except (TypeError, ValueError):
+                    continue
+                if math.isfinite(numeric):
+                    values.append(numeric)
+            if values:
+                plot_data.append((label, np.array(values, dtype=float)))
+
+        if not plot_data:
+            messagebox.showerror("No Metrics", "No numeric loss metrics available for histogram.")
+            return
+
+        fig, axes = plt.subplots(1, len(plot_data), figsize=(6 * len(plot_data), 4))
+        if len(plot_data) == 1:
+            axes = [axes]
+
+        for ax, (label, values) in zip(axes, plot_data):
+            finite = values[np.isfinite(values)]
+            if finite.size == 0:
+                ax.set_visible(False)
+                continue
+
+            data_min = float(finite.min())
+            data_max = float(finite.max())
+            upper_bound = float(np.percentile(finite, 99))
+            if not math.isfinite(upper_bound):
+                upper_bound = data_max
+            if upper_bound <= data_min:
+                upper_bound = data_min + max(abs(data_min) * 0.05, 1e-6)
+
+            # Clip the histogram upper bound to 99th percentile to keep dense shoulders readable.
+            clipped = np.clip(finite, data_min, upper_bound)
+            bin_count = min(60, max(10, int(math.sqrt(finite.size)) * 2))
+            bins = np.linspace(data_min, upper_bound, bin_count + 1)
+            counts, _ = np.histogram(clipped, bins=bins)
+            positive_counts = counts[counts > 0]
+            use_log = bool(positive_counts.size) and counts.max() / positive_counts.min() > 50
+
+            ax.hist(clipped, bins=bins, color="#3b75af", edgecolor="black", alpha=0.7, log=use_log)
+            tail_count = int((finite > upper_bound).sum())
+            if tail_count:
+                ax.text(
+                    0.98,
+                    0.92,
+                    f"{tail_count} values > {upper_bound:.4f}",
+                    ha="right",
+                    va="top",
+                    transform=ax.transAxes,
+                    fontsize=9,
+                    bbox=dict(boxstyle="round", facecolor="white", alpha=0.75),
+                )
+
+            quantile_specs = {
+                "Bottom 10%": (np.percentile(finite, 10), "#5a8fc6", (2, 2)),
+                "Lower third": (np.percentile(finite, 100 / 3.0), "#1f77b4", (5, 3)),
+                "Upper third": (np.percentile(finite, 200 / 3.0), "#1f77b4", (5, 3)),
+                "Top 10%": (np.percentile(finite, 90), "#d62728", (2, 1)),
+            }
+
+            legend_handles = []
+            top_note_y = 0.9
+            bottom_note_y = 0.1
+            for name, (value, color, dash_pattern) in quantile_specs.items():
+                if not math.isfinite(value):
+                    continue
+                plotted_value = min(max(value, data_min), upper_bound)
+                handle = ax.axvline(
+                    plotted_value,
+                    color=color,
+                    linestyle=(0, dash_pattern),
+                    linewidth=1.4,
+                )
+                legend_handles.append((handle, f"{name}: {value:.4f}" + (" (clipped)" if plotted_value != value else "")))
+                if plotted_value != value:
+                    use_top = "Top" in name or "Upper" in name
+                    text_y = top_note_y if use_top else bottom_note_y
+                    top_note_y -= 0.08 if use_top else 0.0
+                    bottom_note_y += 0.08 if not use_top else 0.0
+                    ax.text(
+                        0.98,
+                        text_y,
+                        f"{name} beyond view",
+                        ha="right",
+                        va="top" if use_top else "bottom",
+                        transform=ax.transAxes,
+                        fontsize=8,
+                        color=color,
+                    )
+
+            if legend_handles:
+                ax.legend(
+                    [h for h, _ in legend_handles],
+                    [desc for _, desc in legend_handles],
+                    frameon=False,
+                    fontsize=8,
+                    loc="upper left",
+                )
+
+            ax.set_title(label)
+            ax.set_xlim(data_min, upper_bound)
+            ax.set_xlabel(label)
+            ax.set_ylabel("Count (log)" if use_log else "Count")
+            ax.grid(axis='y', alpha=0.2)
+
+        fig.suptitle("Loss Metric Distributions")
+        fig.tight_layout(rect=(0.0, 0.0, 1.0, 0.95))
+        plt.show()
 
 
 def main():

@@ -336,7 +336,20 @@ def remap_cached_entries_source(entries: List[Dict[str, Any]], new_source_id: st
             attr = None
             if isinstance(tgt, dict):
                 attr = tgt.get("attr")
-            e2["id"] = f"{new_source_id}:{attr or ''}"
+            original_subject = e2.get("original_subject_id")
+            if original_subject is None and isinstance(tgt, dict):
+                original_subject = tgt.get("subject_id")
+
+            parts: List[str] = []
+            if new_source_id:
+                parts.append(new_source_id)
+            if isinstance(original_subject, str) and original_subject:
+                parts.append(original_subject)
+            if isinstance(attr, str) and attr:
+                parts.append(attr)
+            e2["id"] = ":".join(parts)
+            if original_subject is not None:
+                e2["original_subject_id"] = original_subject
             # If nested datapoint exists, update its source_id as well
             try:
                 dp_nested = e2.get("datapoint")

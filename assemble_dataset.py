@@ -35,15 +35,18 @@ BASE_PATH = r".\Dataset\Prepared_st2\\"
 # The concrete paths are derived in main() to allow --base_path override.
 
 BATCH_SIZE = 24
-REQUIRED_COUNT = 800 * BATCH_SIZE
-REGULARIZATION_COUNT = 200 * BATCH_SIZE
+REGULAR_BATCHES = 1000
+REGULARIZATION_BATCHES = 500
+REGULAR_COUNT = REGULAR_BATCHES * BATCH_SIZE
+REGULARIZATION_COUNT = REGULARIZATION_BATCHES * BATCH_SIZE
+TOTAL_STEPS = REGULAR_BATCHES + REGULARIZATION_BATCHES
 
 EVAL_BATCH_SIZE = 18
 EVAL_BATCHES = 30
 REPLACE_EVAL_THRESHOLD = 0.05
 
-HIGH_LOSS_THRESHOLD = 3
-MEDIUM_LOSS_MIN = 1
+HIGH_LOSS_THRESHOLD = 1
+MEDIUM_LOSS_MIN = 0.25
 LOW_LOSS_MIN = 0.0
 
 # Deterministic RNG seed for stable shuffles across runs
@@ -303,6 +306,19 @@ def dedupe_entries_by_id(entries: List[Dict[str, Any]], seen_ids: Optional[Set[s
     return out, seen_ids
 
 
+def dedupe_entries_by_identity(entries: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Return entries with unique object identity, preserving order."""
+    seen: Set[int] = set()
+    out: List[Dict[str, Any]] = []
+    for e in entries:
+        oid = id(e)
+        if oid in seen:
+            continue
+        seen.add(oid)
+        out.append(e)
+    return out
+
+
 def is_flip(entry: Dict[str, Any]) -> bool:
     """Check if an entry represents a flip (prediction doesn't match actual value)."""
     ct = get_critical_token(entry)
@@ -326,6 +342,13 @@ def count_no_change(entries: List[Dict[str, Any]]) -> int:
     )
 
 
+def has_no_change_flag(entry: Dict[str, Any]) -> bool:
+    """Return True when entry is explicitly marked as no_change."""
+    sentinel = "!!no_change!!\" />"
+    prompt = entry.get('prompt')
+    return isinstance(prompt, str) and prompt.endswith(sentinel)
+
+
 def sort_by_flip_priority(entries: List[Dict[str, Any]], flips_first: bool = True) -> List[Dict[str, Any]]:
     """Sort entries prioritizing flips first or non-flips first."""
     return sorted(
@@ -342,6 +365,232 @@ def sort_by_flip_priority(entries: List[Dict[str, Any]], flips_first: bool = Tru
 def extract_synth_flips(synth_train: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """Extract synthetic entries where prediction doesn't match actual value."""
     return [entry for entry in synth_train if is_flip(entry)]
+
+
+def get_difficulty_bucket(entry: Dict[str, Any]) -> str:
+    """Return the difficulty bucket label for a given entry."""
+    difficulty = get_completion_difficulty(entry)
+    if difficulty > HIGH_LOSS_THRESHOLD:
+        return "high"
+    if difficulty > MEDIUM_LOSS_MIN:
+        return "medium"
+    if difficulty > LOW_LOSS_MIN:
+        return "low"
+    return "other"
+
+
+def rebalance_batches_for_requirement(
+    batches: List[List[Dict[str, Any]]],
+    predicate: Callable[[Dict[str, Any]], bool],
+) -> int:
+    """Ensure each batch satisfies predicate when surplus entries exist.
+
+    Returns the number of batches still lacking entries that satisfy the predicate
+    after attempting to rebalance. Swaps preserve batch sizes and aim to keep
+    difficulty composition stable when possible.
+    """
+
+    def batch_has_requirement(batch: List[Dict[str, Any]]) -> bool:
+        return any(predicate(entry) for entry in batch)
+
+    lacking = [idx for idx, batch in enumerate(batches) if not batch_has_requirement(batch)]
+    if not lacking:
+        return 0
+
+    made_progress = True
+    while lacking and made_progress:
+        made_progress = False
+        for target_idx in list(lacking):
+            donor_idx = next(
+                (
+                    idx
+                    for idx, donor_batch in enumerate(batches)
+                    if idx != target_idx and sum(1 for entry in donor_batch if predicate(entry)) > 1
+                ),
+                None,
+            )
+            if donor_idx is None:
+                continue
+
+            donor_batch = batches[donor_idx]
+            target_batch = batches[target_idx]
+
+            donor_entry_idx = next(
+                (i for i, entry in enumerate(donor_batch) if predicate(entry)),
+                None,
+            )
+            if donor_entry_idx is None:
+                continue
+
+            donor_entry = donor_batch[donor_entry_idx]
+            donor_bucket = get_difficulty_bucket(donor_entry)
+
+            replacement_idx = next(
+                (
+                    i
+                    for i, entry in enumerate(target_batch)
+                    if not predicate(entry) and get_difficulty_bucket(entry) == donor_bucket
+                ),
+                None,
+            )
+            if replacement_idx is None:
+                replacement_idx = next(
+                    (i for i, entry in enumerate(target_batch) if not predicate(entry)),
+                    None,
+                )
+            if replacement_idx is None:
+                continue
+
+            replacement_entry = target_batch[replacement_idx]
+            donor_batch[donor_entry_idx] = replacement_entry
+            target_batch[replacement_idx] = donor_entry
+            made_progress = True
+
+        lacking = [idx for idx, batch in enumerate(batches) if not batch_has_requirement(batch)]
+
+    return len(lacking)
+
+
+def engineer_balanced_batches(
+    entries: List[Dict[str, Any]],
+    batch_size: int,
+    synthetic_ids: Set[int],
+    rng_seed: int,
+) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+    """Arrange entries into batches with balanced difficulty and required coverage.
+
+    Returns the reordered entries along with batch metrics for diagnostics.
+    """
+
+    if not entries:
+        return [], {
+            "total_batches": 0,
+            "synthetic_available_batches": 0,
+            "synthetic_batches_covered": 0,
+            "synthetic_batches_missing": 0,
+            "no_change_available_batches": 0,
+            "no_change_batches_covered": 0,
+            "no_change_batches_missing": 0,
+            "mean_of_batch_means": 0.0,
+            "std_of_batch_means": 0.0,
+            "mean_of_batch_medians": 0.0,
+            "std_of_batch_medians": 0.0,
+        }
+
+    rng = random.Random(rng_seed)
+    pools: Dict[str, List[Dict[str, Any]]] = {"high": [], "medium": [], "low": [], "other": []}
+    for entry in entries:
+        pools[get_difficulty_bucket(entry)].append(entry)
+
+    for pool in pools.values():
+        rng.shuffle(pool)
+
+    total_batches = math.ceil(len(entries) / batch_size)
+    batches: List[List[Dict[str, Any]]] = []
+    ordered_categories = ("high", "medium", "low", "other")
+
+    # Calculate the ideal proportion of each category per batch
+    total_entries = len(entries)
+    category_ratios = {cat: len(pools[cat]) / total_entries if total_entries else 0 for cat in ordered_categories}
+
+    for batch_idx in range(total_batches):
+        batch: List[Dict[str, Any]] = []
+        remaining_capacity = batch_size
+
+        # Determine actual batch size (last batch may be smaller)
+        actual_batch_size = min(batch_size, sum(len(pools[cat]) for cat in ordered_categories))
+
+        # Calculate proportional targets for this batch based on original ratios
+        targets: Dict[str, int] = {}
+        allocated = 0
+        for cat in ordered_categories:
+            if cat == ordered_categories[-1]:
+                # Last category gets the remainder to avoid rounding errors
+                targets[cat] = actual_batch_size - allocated
+            else:
+                targets[cat] = round(category_ratios[cat] * actual_batch_size)
+                allocated += targets[cat]
+
+        # Fill batch according to proportional targets
+        for category in ordered_categories:
+            pool = pools[category]
+            target = min(targets[category], len(pool), remaining_capacity)
+
+            for _ in range(target):
+                if not pool or remaining_capacity <= 0:
+                    break
+                batch.append(pool.pop())
+                remaining_capacity -= 1
+
+        # Fill any remaining capacity from whatever is available
+        while remaining_capacity > 0:
+            picked: Optional[Dict[str, Any]] = None
+            for category in ordered_categories:
+                pool = pools[category]
+                if pool:
+                    picked = pool.pop()
+                    break
+            if picked is None:
+                break
+            batch.append(picked)
+            remaining_capacity -= 1
+
+        batches.append(batch)
+
+    synthetic_predicate = lambda entry: id(entry) in synthetic_ids
+    no_change_predicate = has_no_change_flag
+
+    synthetic_total = sum(1 for entry in entries if synthetic_predicate(entry))
+    no_change_total = sum(1 for entry in entries if no_change_predicate(entry))
+
+    synthetic_available_batches = min(total_batches, synthetic_total)
+    no_change_available_batches = min(total_batches, no_change_total)
+
+    if synthetic_total:
+        synthetic_missing = rebalance_batches_for_requirement(batches, synthetic_predicate)
+    else:
+        synthetic_missing = total_batches
+
+    if no_change_total:
+        no_change_missing = rebalance_batches_for_requirement(batches, no_change_predicate)
+    else:
+        no_change_missing = total_batches
+
+    synthetic_batches_covered = total_batches - synthetic_missing
+    no_change_batches_covered = total_batches - no_change_missing
+
+    ordered_entries = [entry for batch in batches for entry in batch]
+
+    # Calculate per-batch difficulty statistics
+    batch_mean_difficulties: List[float] = []
+    batch_median_difficulties: List[float] = []
+    for batch in batches:
+        if batch:
+            difficulties = [get_completion_difficulty(e) for e in batch]
+            batch_mean_difficulties.append(statistics.mean(difficulties))
+            batch_median_difficulties.append(statistics.median(difficulties))
+
+    # Compute std of mean and median across batches
+    mean_of_batch_means = statistics.mean(batch_mean_difficulties) if batch_mean_difficulties else 0.0
+    std_of_batch_means = statistics.stdev(batch_mean_difficulties) if len(batch_mean_difficulties) > 1 else 0.0
+    mean_of_batch_medians = statistics.mean(batch_median_difficulties) if batch_median_difficulties else 0.0
+    std_of_batch_medians = statistics.stdev(batch_median_difficulties) if len(batch_median_difficulties) > 1 else 0.0
+
+    metrics = {
+        "total_batches": total_batches,
+        "synthetic_available_batches": synthetic_available_batches,
+        "synthetic_batches_covered": synthetic_batches_covered,
+        "synthetic_batches_missing": synthetic_missing,
+        "no_change_available_batches": no_change_available_batches,
+        "no_change_batches_covered": no_change_batches_covered,
+        "no_change_batches_missing": no_change_missing,
+        "mean_of_batch_means": mean_of_batch_means,
+        "std_of_batch_means": std_of_batch_means,
+        "mean_of_batch_medians": mean_of_batch_medians,
+        "std_of_batch_medians": std_of_batch_medians,
+    }
+
+    return ordered_entries, metrics
 
 
 def print_file_contributions(
@@ -782,11 +1031,25 @@ def main():
 
     print_bucket_stats(high_loss, medium_loss, low_loss, zero_loss, synth_train, train)
 
-    train += high_loss * 3 + medium_loss
+    # Prioritize high and medium difficulty entries without replicating identical objects
+    high_loss_oids = {id(entry) for entry in high_loss}
+    medium_loss_oids = {id(entry) for entry in medium_loss}
+    unique_train = dedupe_entries_by_identity(train)
+
+    def priority_key(entry: Dict[str, Any]) -> Tuple[int, float, int]:
+        oid = id(entry)
+        priority = 2 if oid in high_loss_oids else 1 if oid in medium_loss_oids else 0
+        return (
+            priority,
+            get_completion_difficulty(entry),
+            len(entry.get('prompt', '')),
+        )
+
+    prioritized_pool = sorted(unique_train, key=priority_key, reverse=True)
 
     # Create Stage 2 dataset (high-quality subset)
-    count = REQUIRED_COUNT - len(synth_train)
-    train_high = sort_by_difficulty_and_length(train)[:count]
+    count = max(0, min(REGULAR_COUNT - len(synth_train), len(prioritized_pool)))
+    train_high = prioritized_pool[:count]
 
     if len(train_high) > 0:
         print(f"Minimum loss: {min(get_completion_difficulty(entry) for entry in train_high)}")
@@ -794,7 +1057,7 @@ def main():
     train_high += synth_train
 
     # Create low-priority training data, prioritizing flips
-    train_remaining = sort_by_difficulty_and_length(train)[count:]
+    train_remaining = prioritized_pool[count:]
     train_remaining_flips_first = sort_by_flip_priority(train_remaining, flips_first=True)
 
     # For regularization, take from the end (non-flips prioritized)
@@ -831,7 +1094,60 @@ def main():
         pct_of_selected = ((len(entries) / total_selected) * 100.0) if total_selected > 0 else 0.0
         print(f"{stat}: {len(entries)} (flips: {flip_count}, {pct:.1f}% pool, {pct_of_selected:.1f}% selected)")
 
-    random.shuffle(train_high)
+    synthetic_entry_ids = {id(entry) for entry in synth_train}
+    train_high, batch_metrics = engineer_balanced_batches(
+        train_high,
+        BATCH_SIZE,
+        synthetic_entry_ids,
+        RNG_SEED,
+    )
+
+    total_batches = batch_metrics["total_batches"]
+    if total_batches:
+        synthetic_missing = batch_metrics["synthetic_batches_missing"]
+        synthetic_available = batch_metrics["synthetic_available_batches"]
+        synthetic_covered = batch_metrics["synthetic_batches_covered"]
+        if synthetic_available < total_batches:
+            print(
+                f"[WARN] Synthetic supply covers only {synthetic_available} of {total_batches} batches; "
+                f"{total_batches - synthetic_available} batches lack synthetic entries."
+            )
+        elif synthetic_missing:
+            print(
+                f"[WARN] Could not rebalance synthetic entries for {synthetic_missing} batches despite available supply."
+            )
+
+        no_change_missing = batch_metrics["no_change_batches_missing"]
+        no_change_available = batch_metrics["no_change_available_batches"]
+        no_change_covered = batch_metrics["no_change_batches_covered"]
+        if no_change_available < total_batches:
+            print(
+                f"[WARN] Only {no_change_available} of {total_batches} batches can include no_change entries; "
+                f"{total_batches - no_change_available} batches lack them."
+            )
+        elif no_change_missing:
+            print(
+                f"[WARN] Could not rebalance no_change entries for {no_change_missing} batches despite available supply."
+            )
+
+        print(
+            f"Balanced batches: synthetic coverage {synthetic_covered}/{total_batches}, no_change coverage {no_change_covered}/{total_batches}."
+        )
+
+        # Print batch difficulty distribution stats
+        print(
+            f"Batch difficulty stats: mean={batch_metrics['mean_of_batch_means']:.3f} (std={batch_metrics['std_of_batch_means']:.3f}), "
+            f"median={batch_metrics['mean_of_batch_medians']:.3f} (std={batch_metrics['std_of_batch_medians']:.3f})"
+        )
+
+        # Print overall dataset difficulty stats
+        all_difficulties = [get_completion_difficulty(e) for e in train_high]
+        if all_difficulties:
+            overall_mean = statistics.mean(all_difficulties)
+            overall_median = statistics.median(all_difficulties)
+            overall_std = statistics.stdev(all_difficulties) if len(all_difficulties) > 1 else 0.0
+            print(f"Overall dataset difficulty: mean={overall_mean:.3f}, median={overall_median:.3f}, std={overall_std:.3f}")
+
     print(f"No-change entries in train_high: {count_no_change(train_high)}")
 
     # Write assembled datasets

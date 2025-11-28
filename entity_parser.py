@@ -159,17 +159,22 @@ def parse_text(
         sid = f"{file_part}:{line_no}" if file_part is not None else ""
 
         if len(next_entities) == 1:
+            subj = getattr(next_entities[0], "subject", None)
+            subj_id = getattr(subj, "id", None) if subj else None
             dp = Datapoint(
                 previous_message=prev_ent,  # type: ignore[arg-type]
                 message=msg_ent,             # type: ignore[arg-type]
                 previous_state=EntityList(prev_entities),
                 state=EntityList(next_entities),
                 source_id=sid,
+                original_subject_id=subj_id,
             )
             datapoints.append(dp)
         else:
             for ent in next_entities:
                 context_cls = ent.__class__.context_classes
+                subj = getattr(ent, "subject", None)
+                subj_id = getattr(subj, "id", None) if subj else None
 
                 dp = Datapoint(
                     previous_message=prev_ent,  # type: ignore[arg-type]
@@ -178,6 +183,7 @@ def parse_text(
                     state_context=EntityList([ent for ent in next_entities if any(isinstance(ent, cls) for cls in context_cls)]),
                     state=EntityList([ent]),
                     source_id=sid,
+                    original_subject_id=subj_id,
                 )
                 datapoints.append(dp)
 
