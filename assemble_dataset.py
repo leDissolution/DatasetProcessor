@@ -35,8 +35,8 @@ BASE_PATH = r".\Dataset\Prepared_st2\\"
 # The concrete paths are derived in main() to allow --base_path override.
 
 BATCH_SIZE = 24
-REGULAR_BATCHES = 1300
-REGULARIZATION_BATCHES = 700
+REGULAR_BATCHES = 1000
+REGULARIZATION_BATCHES = 500
 REGULAR_COUNT = REGULAR_BATCHES * BATCH_SIZE
 REGULARIZATION_COUNT = REGULARIZATION_BATCHES * BATCH_SIZE
 TOTAL_STEPS = REGULAR_BATCHES + REGULARIZATION_BATCHES
@@ -379,6 +379,38 @@ def get_difficulty_bucket(entry: Dict[str, Any]) -> str:
     return "other"
 
 
+def _pick_diverse_entry_idx(
+    pool: List[Dict[str, Any]],
+    batch_attr_counts: Dict[str, int],
+) -> int:
+    """Return the index of an entry in pool that maximizes attr diversity.
+
+    Prefers entries whose target.attr is least represented in the current batch.
+    Ties are broken by picking the last element (for efficient pop).
+    """
+    if not pool:
+        return 0
+    if len(pool) == 1:
+        return 0
+
+    best_idx = len(pool) - 1  # Default to last for efficient pop()
+    best_count = batch_attr_counts.get(get_target_attr(pool[best_idx]), 0)
+
+    # Only scan a limited window to avoid O(n²) blowup on large pools
+    scan_limit = min(50, len(pool))
+    for i in range(len(pool) - 1, max(-1, len(pool) - 1 - scan_limit), -1):
+        attr = get_target_attr(pool[i])
+        count = batch_attr_counts.get(attr, 0)
+        if count < best_count:
+            best_count = count
+            best_idx = i
+            if best_count == 0:
+                # Can't do better than an attr not yet in the batch
+                break
+
+    return best_idx
+
+
 def rebalance_batches_for_requirement(
     batches: List[List[Dict[str, Any]]],
     predicate: Callable[[Dict[str, Any]], bool],
@@ -475,6 +507,9 @@ def engineer_balanced_batches(
             "std_of_batch_means": 0.0,
             "mean_of_batch_medians": 0.0,
             "std_of_batch_medians": 0.0,
+            "mean_unique_attrs": 0.0,
+            "min_unique_attrs": 0,
+            "max_unique_attrs": 0,
         }
 
     rng = random.Random(rng_seed)
@@ -493,8 +528,15 @@ def engineer_balanced_batches(
     total_entries = len(entries)
     category_ratios = {cat: len(pools[cat]) / total_entries if total_entries else 0 for cat in ordered_categories}
 
+    # Count total entries per attr across all pools for target diversity
+    global_attr_counts: Dict[str, int] = defaultdict(int)
+    for cat in ordered_categories:
+        for entry in pools[cat]:
+            global_attr_counts[get_target_attr(entry)] += 1
+
     for batch_idx in range(total_batches):
         batch: List[Dict[str, Any]] = []
+        batch_attr_counts: Dict[str, int] = defaultdict(int)
         remaining_capacity = batch_size
 
         # Determine actual batch size (last batch may be smaller)
@@ -511,7 +553,7 @@ def engineer_balanced_batches(
                 targets[cat] = round(category_ratios[cat] * actual_batch_size)
                 allocated += targets[cat]
 
-        # Fill batch according to proportional targets
+        # Fill batch according to proportional targets, preferring attr diversity
         for category in ordered_categories:
             pool = pools[category]
             target = min(targets[category], len(pool), remaining_capacity)
@@ -519,20 +561,32 @@ def engineer_balanced_batches(
             for _ in range(target):
                 if not pool or remaining_capacity <= 0:
                     break
-                batch.append(pool.pop())
+                # Pick entry that maximizes attr diversity in this batch
+                best_idx = _pick_diverse_entry_idx(pool, batch_attr_counts)
+                entry = pool.pop(best_idx)
+                batch.append(entry)
+                batch_attr_counts[get_target_attr(entry)] += 1
                 remaining_capacity -= 1
 
-        # Fill any remaining capacity from whatever is available
+        # Fill any remaining capacity from whatever is available, still preferring diversity
         while remaining_capacity > 0:
             picked: Optional[Dict[str, Any]] = None
+            best_pool_idx: Optional[int] = None
+            best_category: Optional[str] = None
             for category in ordered_categories:
                 pool = pools[category]
                 if pool:
-                    picked = pool.pop()
+                    idx = _pick_diverse_entry_idx(pool, batch_attr_counts)
+                    if picked is None:
+                        picked = pool[idx]
+                        best_pool_idx = idx
+                        best_category = category
                     break
-            if picked is None:
+            if picked is None or best_pool_idx is None or best_category is None:
                 break
-            batch.append(picked)
+            entry = pools[best_category].pop(best_pool_idx)
+            batch.append(entry)
+            batch_attr_counts[get_target_attr(entry)] += 1
             remaining_capacity -= 1
 
         batches.append(batch)
@@ -564,17 +618,22 @@ def engineer_balanced_batches(
     # Calculate per-batch difficulty statistics
     batch_mean_difficulties: List[float] = []
     batch_median_difficulties: List[float] = []
+    batch_unique_attrs: List[int] = []
     for batch in batches:
         if batch:
             difficulties = [get_completion_difficulty(e) for e in batch]
             batch_mean_difficulties.append(statistics.mean(difficulties))
             batch_median_difficulties.append(statistics.median(difficulties))
+            batch_unique_attrs.append(len(set(get_target_attr(e) for e in batch)))
 
     # Compute std of mean and median across batches
     mean_of_batch_means = statistics.mean(batch_mean_difficulties) if batch_mean_difficulties else 0.0
     std_of_batch_means = statistics.stdev(batch_mean_difficulties) if len(batch_mean_difficulties) > 1 else 0.0
     mean_of_batch_medians = statistics.mean(batch_median_difficulties) if batch_median_difficulties else 0.0
     std_of_batch_medians = statistics.stdev(batch_median_difficulties) if len(batch_median_difficulties) > 1 else 0.0
+    mean_unique_attrs = statistics.mean(batch_unique_attrs) if batch_unique_attrs else 0.0
+    min_unique_attrs = min(batch_unique_attrs) if batch_unique_attrs else 0
+    max_unique_attrs = max(batch_unique_attrs) if batch_unique_attrs else 0
 
     metrics = {
         "total_batches": total_batches,
@@ -588,6 +647,9 @@ def engineer_balanced_batches(
         "std_of_batch_means": std_of_batch_means,
         "mean_of_batch_medians": mean_of_batch_medians,
         "std_of_batch_medians": std_of_batch_medians,
+        "mean_unique_attrs": mean_unique_attrs,
+        "min_unique_attrs": min_unique_attrs,
+        "max_unique_attrs": max_unique_attrs,
     }
 
     return ordered_entries, metrics
@@ -1147,6 +1209,12 @@ def main():
             overall_median = statistics.median(all_difficulties)
             overall_std = statistics.stdev(all_difficulties) if len(all_difficulties) > 1 else 0.0
             print(f"Overall dataset difficulty: mean={overall_mean:.3f}, median={overall_median:.3f}, std={overall_std:.3f}")
+
+        # Print attr diversity stats
+        print(
+            f"Batch attr diversity: mean={batch_metrics['mean_unique_attrs']:.1f} unique attrs/batch, "
+            f"min={batch_metrics['min_unique_attrs']}, max={batch_metrics['max_unique_attrs']}"
+        )
 
     print(f"No-change entries in train_high: {count_no_change(train_high)}")
 
