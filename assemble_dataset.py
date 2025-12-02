@@ -524,10 +524,6 @@ def engineer_balanced_batches(
     batches: List[List[Dict[str, Any]]] = []
     ordered_categories = ("high", "medium", "low", "other")
 
-    # Calculate the ideal proportion of each category per batch
-    total_entries = len(entries)
-    category_ratios = {cat: len(pools[cat]) / total_entries if total_entries else 0 for cat in ordered_categories}
-
     # Count total entries per attr across all pools for target diversity
     global_attr_counts: Dict[str, int] = defaultdict(int)
     for cat in ordered_categories:
@@ -540,17 +536,23 @@ def engineer_balanced_batches(
         remaining_capacity = batch_size
 
         # Determine actual batch size (last batch may be smaller)
-        actual_batch_size = min(batch_size, sum(len(pools[cat]) for cat in ordered_categories))
+        remaining_total = sum(len(pools[cat]) for cat in ordered_categories)
+        actual_batch_size = min(batch_size, remaining_total)
 
-        # Calculate proportional targets for this batch based on original ratios
+        # Calculate proportional targets dynamically based on CURRENT pool sizes
         targets: Dict[str, int] = {}
         allocated = 0
         for cat in ordered_categories:
+            if remaining_total > 0:
+                # Proportional to current pool size
+                raw_target = len(pools[cat]) / remaining_total * actual_batch_size
+            else:
+                raw_target = 0
             if cat == ordered_categories[-1]:
                 # Last category gets the remainder to avoid rounding errors
-                targets[cat] = actual_batch_size - allocated
+                targets[cat] = max(0, actual_batch_size - allocated)
             else:
-                targets[cat] = round(category_ratios[cat] * actual_batch_size)
+                targets[cat] = round(raw_target)
                 allocated += targets[cat]
 
         # Fill batch according to proportional targets, preferring attr diversity
@@ -569,6 +571,7 @@ def engineer_balanced_batches(
                 remaining_capacity -= 1
 
         # Fill any remaining capacity from whatever is available, still preferring diversity
+        # Prioritize higher difficulty categories first
         while remaining_capacity > 0:
             picked: Optional[Dict[str, Any]] = None
             best_pool_idx: Optional[int] = None
@@ -577,10 +580,9 @@ def engineer_balanced_batches(
                 pool = pools[category]
                 if pool:
                     idx = _pick_diverse_entry_idx(pool, batch_attr_counts)
-                    if picked is None:
-                        picked = pool[idx]
-                        best_pool_idx = idx
-                        best_category = category
+                    picked = pool[idx]
+                    best_pool_idx = idx
+                    best_category = category
                     break
             if picked is None or best_pool_idx is None or best_category is None:
                 break
@@ -629,6 +631,8 @@ def engineer_balanced_batches(
     # Compute std of mean and median across batches
     mean_of_batch_means = statistics.mean(batch_mean_difficulties) if batch_mean_difficulties else 0.0
     std_of_batch_means = statistics.stdev(batch_mean_difficulties) if len(batch_mean_difficulties) > 1 else 0.0
+    min_batch_mean = min(batch_mean_difficulties) if batch_mean_difficulties else 0.0
+    max_batch_mean = max(batch_mean_difficulties) if batch_mean_difficulties else 0.0
     mean_of_batch_medians = statistics.mean(batch_median_difficulties) if batch_median_difficulties else 0.0
     std_of_batch_medians = statistics.stdev(batch_median_difficulties) if len(batch_median_difficulties) > 1 else 0.0
     mean_unique_attrs = statistics.mean(batch_unique_attrs) if batch_unique_attrs else 0.0
@@ -650,6 +654,8 @@ def engineer_balanced_batches(
         "mean_unique_attrs": mean_unique_attrs,
         "min_unique_attrs": min_unique_attrs,
         "max_unique_attrs": max_unique_attrs,
+        "min_batch_mean": min_batch_mean,
+        "max_batch_mean": max_batch_mean,
     }
 
     return ordered_entries, metrics
@@ -1209,6 +1215,7 @@ def main():
             overall_median = statistics.median(all_difficulties)
             overall_std = statistics.stdev(all_difficulties) if len(all_difficulties) > 1 else 0.0
             print(f"Overall dataset difficulty: mean={overall_mean:.3f}, median={overall_median:.3f}, std={overall_std:.3f}")
+            print(f"Min batch mean difficulty: {batch_metrics['min_batch_mean']:.3f}, Max batch mean difficulty: {batch_metrics['max_batch_mean']:.3f}")
 
         # Print attr diversity stats
         print(
