@@ -34,7 +34,7 @@ import math
 BASE_PATH = r".\Dataset\Prepared_st2\\"
 # The concrete paths are derived in main() to allow --base_path override.
 
-BATCH_SIZE = 24
+BATCH_SIZE = 16
 REGULAR_BATCHES = 1000
 REGULARIZATION_BATCHES = 500
 REGULAR_COUNT = REGULAR_BATCHES * BATCH_SIZE
@@ -1025,6 +1025,8 @@ def main():
     print(f"Removed {original_train_count - len(train)} training entries that share ids with eval entries")
 
     high_loss, medium_loss, low_loss, zero_loss = create_loss_buckets(train)
+
+    medium_loss *= 2
 
     # Build optional Big Eval set (does not affect training contamination)
     big_eval: List[Dict[str, Any]] = []

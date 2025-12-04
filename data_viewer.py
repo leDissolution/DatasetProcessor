@@ -44,6 +44,7 @@ class DataViewer:
         
         self.data = []  # currently displayed data (filtered or not)
         self.all_data = []  # all loaded entries (unfiltered)
+        self.raw_data = []  # all entries before id-deduplication
         self.flips_only_data = []  # only flips
         self.entries_by_id = {}  # all versions grouped by id
         self.natural_all_data = []  # original load order (all entries)
@@ -152,7 +153,12 @@ class DataViewer:
         self.sort_combobox.bind("<<ComboboxSelected>>", lambda e: self.change_sort_metric())
         self.sort_combobox.set(self.sort_choice.get())
 
-        ttk.Button(bottom_row, text="Loss Histograms", command=self.show_loss_histograms).grid(row=0, column=2, padx=(0, 5))
+        histogram_menu_btn = ttk.Menubutton(bottom_row, text="Loss Histograms")
+        histogram_menu = tk.Menu(histogram_menu_btn, tearoff=0)
+        histogram_menu.add_command(label="Deduplicated (by ID)", command=lambda: self.show_loss_histograms(deduplicated=True))
+        histogram_menu.add_command(label="All Entries", command=lambda: self.show_loss_histograms(deduplicated=False))
+        histogram_menu_btn["menu"] = histogram_menu
+        histogram_menu_btn.grid(row=0, column=2, padx=(0, 5))
 
         ttk.Frame(bottom_row).grid(row=0, column=3, sticky="ew")  # spacer
 
@@ -291,6 +297,7 @@ class DataViewer:
     def load_file(self, file_path):
         try:
             self.all_data = []
+            self.raw_data = []
             self.entries_by_id = {}
             unique = {}
             self.natural_all_data = []
@@ -301,6 +308,7 @@ class DataViewer:
                     if line:
                         try:
                             entry = json.loads(line)
+                            self.raw_data.append(entry)
                             # Use id as unique key
                             key = entry.get('id', None)
                             if key is not None:
@@ -798,7 +806,7 @@ class DataViewer:
         if getattr(self, "difficulty_variance_window", None) is window:
             self.difficulty_variance_window = None
 
-    def show_loss_histograms(self):
+    def show_loss_histograms(self, deduplicated=True):
         if plt is None:
             messagebox.showerror("Matplotlib Required", "Matplotlib is not available. Install it to view histograms.")
             return
@@ -809,6 +817,9 @@ class DataViewer:
             messagebox.showerror("No Data", "Load a dataset before viewing histograms.")
             return
 
+        source_data = self.all_data if deduplicated else self.raw_data
+        data_label = "Deduplicated" if deduplicated else "All Entries"
+
         metric_specs = [
             ("worst_loss", self.metric_labels.get("worst_loss", "Worst Loss")),
             ("completion_difficulty", self.metric_labels.get("completion_difficulty", "Completion Difficulty")),
@@ -817,7 +828,7 @@ class DataViewer:
         plot_data = []
         for key, label in metric_specs:
             values = []
-            for entry in self.all_data:
+            for entry in source_data:
                 value = self._get_loss_metric_value(entry, key)
                 if value is None:
                     continue
@@ -926,7 +937,7 @@ class DataViewer:
             ax.set_ylabel("Count (log)" if use_log else "Count")
             ax.grid(axis='y', alpha=0.2)
 
-        fig.suptitle("Loss Metric Distributions")
+        fig.suptitle(f"Loss Metric Distributions ({data_label}, n={len(source_data)})")
         fig.tight_layout(rect=(0.0, 0.0, 1.0, 0.95))
         plt.show()
 
