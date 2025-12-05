@@ -10,6 +10,10 @@ CLI options:
                                                      Include Synthetic data (default: True).
     --with_stage3 / --no-with_stage3
                                                      Write Stage3 outputs (default: False).
+    --batch_size N            Batch size for training data assembly (default: 16).
+    --epochs N                Number of epochs for training data (default: 1). Each epoch
+                              reuses high/medium entries in different order but samples a
+                              new low set.
     --exclude_top_percentile X Exclude the top X percent most difficult entries (default: 0).
     --exclude_top_percentile_min_difficulty V
                               Only consider entries with difficulty >= V when applying percentile filtering (default: 0).
@@ -862,6 +866,8 @@ def main():
     parser.add_argument("--with_synthetic", action=argparse.BooleanOptionalAction, default=True, help="Include Synthetic data inputs")
     parser.add_argument("--with_stage3", action=argparse.BooleanOptionalAction, default=False, help="Write Stage3 outputs (train.jsonl, eval.jsonl)")
     parser.add_argument("--big_eval_size", type=int, default=0, help="If > 0, also assemble big_eval.jsonl of this size")
+    parser.add_argument("--batch_size", type=int, default=BATCH_SIZE, help="Batch size for training data assembly")
+    parser.add_argument("--epochs", type=int, default=1, help="Number of epochs for training data. Each epoch reuses high/medium entries in different order but samples a new low set.")
     parser.add_argument(
         "--tokenizer_path",
         type=str,
@@ -1026,7 +1032,7 @@ def main():
 
     high_loss, medium_loss, low_loss, zero_loss = create_loss_buckets(train)
 
-    medium_loss *= 2
+    #medium_loss *= 2
 
     # Build optional Big Eval set (does not affect training contamination)
     big_eval: List[Dict[str, Any]] = []
@@ -1118,29 +1124,73 @@ def main():
     prioritized_pool = sorted(unique_train, key=priority_key, reverse=True)
 
     # Create Stage 2 dataset (high-quality subset)
-    count = max(0, min(REGULAR_COUNT - len(synth_train), len(prioritized_pool)))
-    train_high = prioritized_pool[:count]
-
-    if len(train_high) > 0:
-        print(f"Minimum loss: {min(get_completion_difficulty(entry) for entry in train_high)}")
-
-    train_high += synth_train
-
-    # Create low-priority training data, prioritizing flips
+    regular_count = REGULAR_BATCHES * args.batch_size
+    count = max(0, min(regular_count - len(synth_train), len(prioritized_pool)))
+    
+    # Separate high+medium from low entries for epoch handling
+    high_medium_entries = [e for e in prioritized_pool[:count] if id(e) in high_loss_oids or id(e) in medium_loss_oids]
+    low_entries_in_regular = [e for e in prioritized_pool[:count] if id(e) not in high_loss_oids and id(e) not in medium_loss_oids]
+    
+    # Create low-priority training data pool (entries beyond regular count)
     train_remaining = prioritized_pool[count:]
     train_remaining_flips_first = sort_by_flip_priority(train_remaining, flips_first=True)
 
     # For regularization, take from the end (non-flips prioritized)
     train_remaining_nonflips_first = sort_by_flip_priority(train_remaining, flips_first=True)
-    regularization_entries = train_remaining_nonflips_first[:REGULARIZATION_COUNT]
-
-    train_high += regularization_entries
+    regularization_count = REGULARIZATION_BATCHES * args.batch_size
+    
+    # Full low pool includes low entries from regular selection plus regularization pool
+    low_pool_for_epochs = low_entries_in_regular + train_remaining_nonflips_first
+    
+    # Build epochs: reuse high+medium+synth in different order, sample new low each epoch
+    num_epochs = max(1, args.epochs)
+    train_high_all_epochs: List[Dict[str, Any]] = []
+    
+    # Calculate how many low entries we need per epoch
+    low_count_per_epoch = len(low_entries_in_regular) + regularization_count
+    
+    print(f"Building {num_epochs} epoch(s): {len(high_medium_entries)} high+medium, {len(synth_train)} synthetic, {low_count_per_epoch} low per epoch")
+    
+    for epoch_idx in range(num_epochs):
+        epoch_rng = random.Random(RNG_SEED + epoch_idx)
+        
+        # Shuffle high+medium entries for this epoch
+        epoch_high_medium = list(high_medium_entries)
+        epoch_rng.shuffle(epoch_high_medium)
+        
+        # Shuffle and sample low entries for this epoch
+        epoch_low_pool = list(low_pool_for_epochs)
+        epoch_rng.shuffle(epoch_low_pool)
+        epoch_low = epoch_low_pool[:low_count_per_epoch]
+        
+        # Shuffle synthetic for this epoch
+        epoch_synth = list(synth_train)
+        epoch_rng.shuffle(epoch_synth)
+        
+        # Combine for this epoch
+        epoch_entries = epoch_high_medium + epoch_low + epoch_synth
+        train_high_all_epochs.extend(epoch_entries)
+        
+        if epoch_idx == 0:
+            # Report stats for first epoch
+            if len(epoch_high_medium) + len(epoch_low) > 0:
+                min_loss = min(get_completion_difficulty(e) for e in (epoch_high_medium + epoch_low))
+                print(f"Epoch {epoch_idx + 1}: Minimum loss: {min_loss}")
+    
+    train_high = train_high_all_epochs
+    
+    # For regularization tracking, use first epoch's selection
+    first_epoch_rng = random.Random(RNG_SEED)
+    first_epoch_low_pool = list(low_pool_for_epochs)
+    first_epoch_rng.shuffle(first_epoch_low_pool)
+    regularization_entries = first_epoch_low_pool[:regularization_count]
 
     # Update train_low to be the remaining entries after regularization selection
     used_for_regularization = set(id(entry) for entry in regularization_entries)
     train_low = [entry for entry in train_remaining if id(entry) not in used_for_regularization]
     print(f"Selected {len(regularization_entries)} regularization entries (flips: {count_flips(regularization_entries)})")
-    print(f"Remaining in train_low: {len(train_low)} (flips: {count_flips(train_low)})")
+    print(f"Remaining in train_low: {len(train_low)} (flips: {count_flips(train_low)})") 
+    print(f"Total train_high entries across {num_epochs} epoch(s): {len(train_high)}")
 
     # Create stat buckets for analysis
     buckets = defaultdict(list)
@@ -1167,7 +1217,7 @@ def main():
     synthetic_entry_ids = {id(entry) for entry in synth_train}
     train_high, batch_metrics = engineer_balanced_batches(
         train_high,
-        BATCH_SIZE,
+        args.batch_size,
         synthetic_entry_ids,
         RNG_SEED,
     )
