@@ -40,6 +40,7 @@ from .filtering import (
 from .batch_engineering import (
     engineer_balanced_batches,
     rebalance_batches_for_requirement,
+    engineer_attr_balanced_batches,
 )
 
 from .reporting import (
@@ -102,6 +103,7 @@ __all__ = [
     # Batch engineering
     "engineer_balanced_batches",
     "rebalance_batches_for_requirement",
+    "engineer_attr_balanced_batches",
     # Reporting
     "print_bucket_stats",
     "print_top_unique_sources",
