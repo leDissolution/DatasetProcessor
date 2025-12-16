@@ -95,6 +95,56 @@ def _compute_epoch_uniqueness(
     }
 
 
+def _pad_entries_to_batch_size(
+    entries: List[Dict[str, Any]],
+    batch_size: int,
+    rng_seed: int,
+) -> Tuple[List[Dict[str, Any]], int]:
+    """Pad entries with duplicates from lowest represented attr to make count divisible by batch_size.
+    
+    Returns:
+        Tuple of (padded_entries, num_duplicates_added)
+    """
+    import random
+    import copy
+    
+    remainder = len(entries) % batch_size
+    if remainder == 0:
+        return entries, 0
+    
+    needed = batch_size - remainder
+    
+    # Count entries per attr
+    attr_counts: Dict[str, int] = defaultdict(int)
+    attr_entries: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+    for entry in entries:
+        attr = get_target_attr(entry)
+        attr_counts[attr] += 1
+        attr_entries[attr].append(entry)
+    
+    # Sort attrs by count (ascending) to prioritize lowest represented
+    sorted_attrs = sorted(attr_counts.keys(), key=lambda a: attr_counts[a])
+    
+    rng = random.Random(rng_seed)
+    duplicates: List[Dict[str, Any]] = []
+    
+    # Round-robin from lowest represented attrs
+    attr_idx = 0
+    while len(duplicates) < needed:
+        attr = sorted_attrs[attr_idx % len(sorted_attrs)]
+        pool = attr_entries[attr]
+        if pool:
+            # Pick a random entry from this attr's pool and deep copy it
+            source_entry = rng.choice(pool)
+            dup = copy.deepcopy(source_entry)
+            # Mark as duplicate for tracking
+            dup["_is_padding_duplicate"] = True
+            duplicates.append(dup)
+        attr_idx += 1
+    
+    return entries + duplicates, len(duplicates)
+
+
 def build_training_epochs(
     entries: List[Dict[str, Any]],
     batch_size: int,
@@ -118,13 +168,18 @@ def build_training_epochs(
     epoch_batches_list: List[List[List[Dict[str, Any]]]] = []
     combined_metrics: Dict[str, Any] = {}
     
-    print(f"Building {num_epochs} epoch(s) with {len(entries)} entries each")
+    # Pad entries to make count divisible by batch_size
+    padded_entries, num_padding = _pad_entries_to_batch_size(entries, batch_size, rng_seed)
+    if num_padding > 0:
+        print(f"Padded {num_padding} duplicate(s) from lowest-represented attrs to fill last batch")
+    
+    print(f"Building {num_epochs} epoch(s) with {len(padded_entries)} entries each")
     
     for epoch_idx in range(num_epochs):
         epoch_seed = rng_seed + epoch_idx
         
         reordered, metrics = engineer_attr_balanced_batches(
-            entries,
+            padded_entries,
             batch_size=batch_size,
             rng_seed=epoch_seed,
             max_per_attr=max_per_attr,
@@ -150,6 +205,7 @@ def build_training_epochs(
         print(f"Epoch {epoch_idx + 1}: {len(reordered)} entries, seed={epoch_seed}")
     
     combined_metrics["total_entries"] = len(all_epochs_entries)
+    combined_metrics["padding_duplicates"] = num_padding
     
     # Compute epoch uniqueness metrics
     if num_epochs > 1:
