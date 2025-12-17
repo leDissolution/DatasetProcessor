@@ -32,10 +32,16 @@ _ATTRIBUTE_VALUE_RE = re.compile(r'"([^"]*)"')
 
 
 def _wrap_attribute_values(line: str) -> str:
-    """Wrap each quoted value as **/text/**; leave already wrapped values intact."""
+    """Wrap each quoted value as **/text/**; skip the first match and leave already wrapped values intact."""
+
+    seen_first = False
 
     def _replace(match: re.Match[str]) -> str:
+        nonlocal seen_first
         value = match.group(1)
+        if not seen_first:
+            seen_first = True
+            return match.group(0)
         if value.startswith("**/") and value.endswith("/**"):
             return match.group(0)
         return f'"**/{value}/**"'
