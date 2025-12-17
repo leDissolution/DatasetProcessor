@@ -237,6 +237,22 @@ def _build_length_fn(tokenizer_path: Optional[str]) -> Optional[Callable[[Dict[s
         return None
 
 
+def _print_attr_counts(entries: List[Dict[str, Any]], label: str) -> None:
+    attr_counts: Dict[str, int] = defaultdict(int)
+    attr_no_change_counts: Dict[str, int] = defaultdict(int)
+    for entry in entries:
+        attr = get_target_attr(entry)
+        attr_counts[attr] += 1
+        if has_no_change_flag(entry):
+            attr_no_change_counts[attr] += 1
+
+    attr_summary = {
+        attr: f"{count} ({attr_no_change_counts.get(attr, 0)})"
+        for attr, count in sorted(attr_counts.items(), key=lambda kv: -kv[1])
+    }
+    print(f"{label} attr counts:", attr_summary)
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Assemble Stage0 dataset with balanced batches")
     parser.add_argument(
@@ -327,20 +343,8 @@ def main() -> None:
     eval_entries = filter_entries_by_attr(eval_entries)
     print(f"Loaded {len(eval_entries)} eval entries from {len(eval_files)} file(s)")
 
-    # Count entries per attr
-    attr_counts: Dict[str, int] = defaultdict(int)
-    attr_no_change_counts: Dict[str, int] = defaultdict(int)
-    for entry in entries:
-        attr = get_target_attr(entry)
-        attr_counts[attr] += 1
-        if has_no_change_flag(entry):
-            attr_no_change_counts[attr] += 1
-
-    attr_summary = {
-        attr: f"{count} ({attr_no_change_counts.get(attr, 0)})"
-        for attr, count in sorted(attr_counts.items(), key=lambda kv: -kv[1])
-    }
-    print("Attr counts:", attr_summary)
+    _print_attr_counts(entries, "Train")
+    _print_attr_counts(eval_entries, "Eval")
 
     length_fn = _build_length_fn(args.tokenizer_path.strip()) if args.tokenizer_path else None
 
