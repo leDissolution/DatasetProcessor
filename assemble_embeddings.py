@@ -32,7 +32,12 @@ _ATTRIBUTE_VALUE_RE = re.compile(r'"([^"]*)"')
 
 
 def _wrap_attribute_values(line: str) -> str:
-    """Wrap each quoted value as **/text/**; skip the first match and leave already wrapped values intact."""
+    """
+    Mask entire line except attribute values (skipping the first).
+    
+    - Wraps the whole line with **/ ... /**  (mask start/end).
+    - Punches holes for attribute values (except first) using /** ... **/ inside quotes.
+    """
 
     seen_first = False
 
@@ -42,11 +47,12 @@ def _wrap_attribute_values(line: str) -> str:
         if not seen_first:
             seen_first = True
             return match.group(0)
-        if value.startswith("**/") and value.endswith("/**"):
+        if value.startswith("/**") and value.endswith("**/"):
             return match.group(0)
-        return f'"**/{value}/**"'
+        return f'"/**{value}**/"'
 
-    return _ATTRIBUTE_VALUE_RE.sub(_replace, line)
+    replaced = _ATTRIBUTE_VALUE_RE.sub(_replace, line)
+    return f"**/{replaced}/**"
 
 
 def _collect_stat_prompts(file_paths: List[str]) -> Tuple[List[Dict[str, str]], int]:
