@@ -24,6 +24,8 @@ CLI options:
                               exclude entries from training.
     --train_file_name NAME    Output filename for the Stage 2 train split (default: train_high.jsonl).
     --eval_file_name NAME     Output filename for the Stage 2 eval split (default: eval.jsonl).
+    --eval_correct_pct PCT    Target percent of per-attr eval entries that are correct (default: 25).
+    --eval_no_change_pct PCT  Target percent of per-attr eval entries with no_change (default: 50).
 """
 
 from collections import defaultdict
@@ -58,8 +60,8 @@ from assembler import (
     # Filtering
     filter_entries_by_attr,
     exclude_top_difficulty_percentile,
-    select_unique_source_entries,
     remove_eval_contamination,
+    dedupe_entries_by_id,
     dedupe_entries_by_identity,
     create_loss_buckets,
     sort_by_flip_priority,
@@ -76,6 +78,7 @@ from assembler import (
     plot_difficulty_histogram,
     calculate_median_loss,
 )
+from assembler.entry_utils import has_no_change_flag, is_flip
 
 
 def build_big_eval(
@@ -146,6 +149,267 @@ def build_big_eval(
             big_eval.extend(add_medium + add_low)
 
     return big_eval
+
+
+def _allocate_attr_targets(
+    attr_buckets: Dict[str, List[Dict[str, Any]]],
+    target_total: int,
+) -> Dict[str, int]:
+    """Allocate target counts per attr proportional to bucket availability."""
+    if target_total <= 0 or not attr_buckets:
+        return {}
+
+    total_available = sum(len(v) for v in attr_buckets.values())
+    if total_available == 0:
+        return {}
+
+    target_total = min(target_total, total_available)
+    allocations: Dict[str, int] = {}
+    remainders: List[Tuple[float, str]] = []
+
+    for attr, entries in attr_buckets.items():
+        share = len(entries) / total_available
+        raw_target = share * target_total
+        base = int(math.floor(raw_target))
+        allocations[attr] = base
+        remainders.append((raw_target - base, attr))
+
+    # Distribute leftover slots by largest remainder first
+    remaining = target_total - sum(allocations.values())
+    for _, attr in sorted(remainders, reverse=True):
+        if remaining <= 0:
+            break
+        if allocations[attr] < len(attr_buckets[attr]):
+            allocations[attr] += 1
+            remaining -= 1
+
+    # If still short due to caps, top up from attrs with supply left
+    if remaining > 0:
+        attrs_by_slack = sorted(
+            attr_buckets.keys(),
+            key=lambda a: len(attr_buckets[a]) - allocations.get(a, 0),
+            reverse=True,
+        )
+        for attr in attrs_by_slack:
+            if remaining <= 0:
+                break
+            slack = len(attr_buckets[attr]) - allocations.get(attr, 0)
+            if slack <= 0:
+                continue
+            add = min(slack, remaining)
+            allocations[attr] = allocations.get(attr, 0) + add
+            remaining -= add
+
+    return allocations
+
+
+def _sample_attr_entries(
+    entries: List[Dict[str, Any]],
+    target_count: int,
+    correct_ratio: float,
+    no_change_ratio: float,
+    rng: random.Random,
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    """Sample entries for a single attr respecting correct/no_change ratios."""
+    if target_count <= 0 or not entries:
+        return [], list(entries)
+
+    pool = list(entries)
+    rng.shuffle(pool)
+
+    no_change_entries = [e for e in pool if has_no_change_flag(e)]
+    correct_entries = [e for e in pool if not is_flip(e) and e not in no_change_entries]
+    flip_entries = [e for e in pool if is_flip(e)]
+
+    target_no_change = min(len(no_change_entries), round(target_count * no_change_ratio))
+    target_correct_total = min(
+        len(no_change_entries) + len(correct_entries),
+        round(target_count * correct_ratio),
+    )
+
+    selected: List[Dict[str, Any]] = []
+
+    # Step 1: take no_change toward its own target (counts as correct too)
+    take_nc = min(target_no_change, len(no_change_entries))
+    selected_no_change = no_change_entries[:take_nc]
+    selected.extend(selected_no_change)
+
+    correct_so_far = len(selected_no_change)
+    nc_left = no_change_entries[take_nc:]
+
+    # Step 2: take non-no_change corrects to reach correct target
+    needed_correct = max(0, target_correct_total - correct_so_far)
+    take_correct = min(needed_correct, len(correct_entries))
+    selected_correct = correct_entries[:take_correct]
+    selected.extend(selected_correct)
+
+    correct_so_far += len(selected_correct)
+    correct_left = correct_entries[take_correct:]
+    flip_left = flip_entries
+
+    remaining_slots = target_count - len(selected)
+    nc_short = max(0, target_no_change - len(selected_no_change))
+    needed_correct = max(0, target_correct_total - correct_so_far)
+
+    # Step 3: top up no_change if we are short and have slots
+    if remaining_slots > 0 and nc_short > 0 and nc_left:
+        take_more_nc = min(remaining_slots, nc_short, len(nc_left))
+        selected.extend(nc_left[:take_more_nc])
+        nc_left = nc_left[take_more_nc:]
+        remaining_slots -= take_more_nc
+        nc_short -= take_more_nc
+        correct_so_far += take_more_nc  # no_change counts as correct
+        needed_correct = max(0, target_correct_total - correct_so_far)
+
+    # Step 4: satisfy any remaining correct requirement (prefer non-no_change corrects, then no_change)
+    if remaining_slots > 0 and needed_correct > 0:
+        take_more_correct = min(remaining_slots, needed_correct, len(correct_left))
+        selected.extend(correct_left[:take_more_correct])
+        correct_left = correct_left[take_more_correct:]
+        remaining_slots -= take_more_correct
+        correct_so_far += take_more_correct
+        needed_correct = max(0, target_correct_total - correct_so_far)
+
+    if remaining_slots > 0 and needed_correct > 0 and nc_left:
+        take_more_nc_for_correct = min(remaining_slots, needed_correct, len(nc_left))
+        selected.extend(nc_left[:take_more_nc_for_correct])
+        nc_left = nc_left[take_more_nc_for_correct:]
+        remaining_slots -= take_more_nc_for_correct
+        correct_so_far += take_more_nc_for_correct
+        needed_correct = max(0, target_correct_total - correct_so_far)
+
+    # Step 5: fill remaining slots preferring flips, then corrects, then no_change
+    if remaining_slots > 0:
+        take_flips = flip_left[:remaining_slots]
+        selected.extend(take_flips)
+        flip_left = flip_left[len(take_flips):]
+        remaining_slots -= len(take_flips)
+
+    if remaining_slots > 0:
+        take_more_correct = correct_left[:remaining_slots]
+        selected.extend(take_more_correct)
+        correct_left = correct_left[len(take_more_correct):]
+        remaining_slots -= len(take_more_correct)
+
+    if remaining_slots > 0:
+        take_more_nc = nc_left[:remaining_slots]
+        selected.extend(take_more_nc)
+        nc_left = nc_left[len(take_more_nc):]
+        remaining_slots -= len(take_more_nc)
+
+    leftover_pool = nc_left + correct_left + flip_left
+
+    return selected, leftover_pool
+
+
+def build_attr_balanced_eval(
+    medium_entries: List[Dict[str, Any]],
+    target_total: int,
+    correct_pct: float,
+    no_change_pct: float,
+    seed_entries: Optional[List[Dict[str, Any]]] = None,
+    rng_seed: int = RNG_SEED,
+) -> List[Dict[str, Any]]:
+    """Build an eval set from the medium bucket with attr-level controls."""
+    seed_entries = seed_entries or []
+    seed_deduped, seed_ids = dedupe_entries_by_id(seed_entries)
+
+    rng = random.Random(rng_seed)
+
+    correct_ratio = max(0.0, min(1.0, correct_pct / 100.0))
+    no_change_ratio = max(0.0, min(1.0, no_change_pct / 100.0))
+
+    # Remove seed ids from the selection pool to avoid duplicates
+    medium_pool = [e for e in medium_entries if e.get('id') not in seed_ids]
+    if not medium_pool or target_total <= len(seed_deduped):
+        return seed_deduped[:target_total]
+
+    selection_target = max(0, min(target_total - len(seed_deduped), len(medium_pool)))
+
+    attr_buckets: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+    for entry in medium_pool:
+        attr_buckets[get_target_attr(entry)].append(entry)
+
+    # Shuffle each bucket deterministically
+    for bucket_entries in attr_buckets.values():
+        rng.shuffle(bucket_entries)
+
+    allocations = _allocate_attr_targets(attr_buckets, selection_target)
+
+    selected: List[Dict[str, Any]] = []
+    leftover: List[Dict[str, Any]] = []
+    seen_ids: Set[str] = set(seed_ids)
+
+    for attr, target_count in allocations.items():
+        chosen, remainder = _sample_attr_entries(
+            attr_buckets[attr], target_count, correct_ratio, no_change_ratio, rng
+        )
+        for entry in chosen:
+            eid = entry.get('id')
+            if eid and eid in seen_ids:
+                continue
+            if eid:
+                seen_ids.add(eid)
+            selected.append(entry)
+        leftover.extend(remainder)
+
+    remaining_needed = selection_target - len(selected)
+    if remaining_needed > 0 and leftover:
+        rng.shuffle(leftover)
+        for entry in leftover:
+            if remaining_needed <= 0:
+                break
+            eid = entry.get('id')
+            if eid and eid in seen_ids:
+                continue
+            if eid:
+                seen_ids.add(eid)
+            selected.append(entry)
+            remaining_needed -= 1
+
+    final_eval, _ = dedupe_entries_by_id(seed_deduped + selected)
+
+    if len(final_eval) < target_total:
+        extra_needed = target_total - len(final_eval)
+        filler_pool = [e for e in leftover if e.get('id') not in seen_ids]
+        rng.shuffle(filler_pool)
+        final_eval.extend(filler_pool[:extra_needed])
+
+    return final_eval[:target_total]
+
+
+def print_eval_attr_stats(
+    eval_entries: List[Dict[str, Any]],
+    correct_pct_target: float,
+    no_change_pct_target: float,
+) -> None:
+    """Print per-attr stats for the eval set."""
+    total = len(eval_entries)
+    if total == 0:
+        print("[INFO] Eval set is empty")
+        return
+
+    attr_stats: Dict[str, Dict[str, int]] = defaultdict(lambda: {"total": 0, "correct": 0, "no_change": 0})
+    for entry in eval_entries:
+        attr = get_target_attr(entry)
+        stats = attr_stats[attr]
+        stats["total"] += 1
+        if not is_flip(entry):
+            stats["correct"] += 1
+        if has_no_change_flag(entry):
+            stats["no_change"] += 1
+
+    print(
+        f"Eval attr targets: correct~{correct_pct_target:.1f}%, no_change~{no_change_pct_target:.1f}%"
+    )
+    for attr, stats in sorted(attr_stats.items(), key=lambda kv: kv[1]["total"], reverse=True):
+        tot = stats["total"]
+        correct_pct = (stats["correct"] / tot) * 100.0 if tot else 0.0
+        no_change_pct = (stats["no_change"] / tot) * 100.0 if tot else 0.0
+        share_pct = (tot / total) * 100.0
+        print(
+            f"  {attr}: n={tot}, correct={correct_pct:.1f}%, no_change={no_change_pct:.1f}%, share={share_pct:.1f}%"
+        )
 
 
 def build_training_epochs(
@@ -497,6 +761,14 @@ def parse_args() -> argparse.Namespace:
         "--eval_file_name", type=str, default="eval.jsonl",
         help="File name for the assembled evaluation split",
     )
+    parser.add_argument(
+        "--eval_correct_pct", type=float, default=25.0,
+        help="Target percent of per-attr eval entries that are correct predictions",
+    )
+    parser.add_argument(
+        "--eval_no_change_pct", type=float, default=50.0,
+        help="Target percent of per-attr eval entries that are explicit no_change",
+    )
     return parser.parse_args()
 
 
@@ -587,16 +859,31 @@ def main():
 
     high_loss, medium_loss, low_loss, zero_loss = create_loss_buckets(train)
 
+    eval_correct_pct = max(0.0, min(100.0, args.eval_correct_pct))
+    eval_no_change_pct = max(0.0, min(100.0, args.eval_no_change_pct))
+
     # Build eval set if not using existing
     if not use_existing_eval:
         eval_data = [entry for entry in eval_data if get_completion_difficulty(entry) >= REPLACE_EVAL_THRESHOLD]
-        existing_eval_ids = get_eval_ids(eval_data)
-        eval_count = max(0, EVAL_BATCHES * EVAL_BATCH_SIZE - len(eval_data))
-        print(f"Adding {eval_count} entries to eval set")
+        total_eval_target = EVAL_BATCHES * EVAL_BATCH_SIZE
 
-        unique_medium_entries = select_unique_source_entries(medium_loss, eval_count, existing_eval_ids)
-        eval_data += unique_medium_entries
-        print(f"Successfully added {len(unique_medium_entries)} unique entries from medium_loss to eval set")
+        eval_data = build_attr_balanced_eval(
+            medium_loss,
+            total_eval_target,
+            eval_correct_pct,
+            eval_no_change_pct,
+            seed_entries=eval_data,
+            rng_seed=RNG_SEED,
+        )
+        print(
+            f"Eval set built from medium bucket: size={len(eval_data)} target={total_eval_target} "
+            f"correct~{eval_correct_pct:.1f}% no_change~{eval_no_change_pct:.1f}%"
+        )
+    else:
+        total_eval_target = EVAL_BATCHES * EVAL_BATCH_SIZE
+        if len(eval_data) > total_eval_target:
+            eval_data = eval_data[:total_eval_target]
+            print(f"[INFO] Truncated reused eval to {total_eval_target} entries to match eval target")
 
     eval_ids = get_eval_ids(eval_data)
     print(f"Found {len(eval_ids)} unique ids in {'reused' if use_existing_eval else ''} eval set")
@@ -615,6 +902,7 @@ def main():
 
     eval_data = sorted(eval_data, key=lambda x: len(x.get('prompt', '')))
     print(f"No-change entries in eval: {count_no_change(eval_data)}")
+    print_eval_attr_stats(eval_data, eval_correct_pct, eval_no_change_pct)
 
     synth_train = synth_train * 2
 
