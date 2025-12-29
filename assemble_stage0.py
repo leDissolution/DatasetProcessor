@@ -30,6 +30,84 @@ DEFAULT_BATCH_SIZE = 10
 DEFAULT_SEED = 1337
 
 
+def _extract_completion_text(entry: Dict[str, Any]) -> str:
+    """Return the substring after the final '="' marker in the prompt."""
+    prompt = entry.get("prompt", "") or ""
+    marker = '="'
+    idx = prompt.rfind(marker)
+    if idx == -1:
+        return ""
+    return prompt[idx + len(marker) :]
+
+
+class _TextLengthProvider:
+    """Caches text lengths (tokenized if possible) using a custom extractor."""
+
+    def __init__(self, tokenizer: Optional[Any], extractor: Callable[[Dict[str, Any]], str]):
+        self.tokenizer = tokenizer
+        self.extractor = extractor
+        self.cache: Dict[str, int] = {}
+
+    def _cache_missing(self, texts: List[str], *, batch_size: int = 512) -> None:
+        missing = [t for t in texts if t not in self.cache]
+        if not missing:
+            return
+
+        if not self.tokenizer:
+            for t in missing:
+                self.cache[t] = len(t)
+            return
+
+        import math
+
+        total = len(missing)
+        chunks = math.ceil(total / batch_size)
+        start = 0
+        for _ in range(chunks):
+            chunk = missing[start : start + batch_size]
+            start += batch_size
+            try:
+                batch = self.tokenizer(
+                    chunk,
+                    add_special_tokens=False,
+                    return_length=True,
+                    padding=False,
+                    truncation=False,
+                )
+                lengths = batch.get("length")
+                if lengths is None:
+                    lengths = [len(ids) for ids in batch.get("input_ids", []) if isinstance(ids, list)]
+                for text, length in zip(chunk, lengths or []):
+                    self.cache[text] = int(length)
+                # Fallback for any that failed to align
+                for text in chunk:
+                    if text not in self.cache:
+                        self.cache[text] = len(text)
+            except Exception:
+                for text in chunk:
+                    try:
+                        self.cache[text] = len(self.tokenizer.encode(text, add_special_tokens=False))
+                    except Exception:
+                        self.cache[text] = len(text)
+
+    def pretokenize(self, entries: List[Dict[str, Any]]) -> None:
+        texts: List[str] = []
+        for entry in entries:
+            text = self.extractor(entry)
+            if text:
+                texts.append(text)
+        if texts:
+            self._cache_missing(texts)
+
+    def __call__(self, entry: Dict[str, Any]) -> int:
+        text = self.extractor(entry)
+        if not text:
+            return 0
+        if text not in self.cache:
+            self._cache_missing([text])
+        return self.cache.get(text, len(text))
+
+
 def _compute_epoch_uniqueness(
     epoch_batches_list: List[List[List[Dict[str, Any]]]],
 ) -> Dict[str, Any]:
@@ -216,25 +294,35 @@ def build_training_epochs(
     return all_epochs_entries, combined_metrics
 
 
-def _build_length_fn(tokenizer_path: Optional[str]) -> Optional[Callable[[Dict[str, Any]], int]]:
+def _build_tokenizer(tokenizer_path: Optional[str]) -> Optional[Any]:
     if not tokenizer_path:
         return None
     try:
         from transformers import AutoTokenizer
 
-        tokenizer = AutoTokenizer.from_pretrained(tokenizer_path)
-
-        def _len(entry: Dict[str, Any]) -> int:
-            prompt = entry.get("prompt", "") or ""
-            try:
-                return len(tokenizer.encode(prompt, add_special_tokens=False))
-            except Exception:
-                return len(prompt)
-
-        return _len
+        return AutoTokenizer.from_pretrained(tokenizer_path)
     except Exception as e:
         print(f"[WARN] Falling back to character length; tokenizer unavailable: {e}")
         return None
+
+
+def _build_completion_length_provider(tokenizer: Optional[Any]) -> _TextLengthProvider:
+    def _completion_text(entry: Dict[str, Any]) -> str:
+        text = _extract_completion_text(entry)
+        if not text:
+            text = entry.get("completion") or entry.get("response") or entry.get("expected_value") or ""
+        if not text:
+            text = entry.get("prompt", "") or ""
+        return text
+
+    return _TextLengthProvider(tokenizer, _completion_text)
+
+
+def _build_prompt_length_provider(tokenizer: Optional[Any]) -> _TextLengthProvider:
+    def _prompt_text(entry: Dict[str, Any]) -> str:
+        return entry.get("prompt", "") or ""
+
+    return _TextLengthProvider(tokenizer, _prompt_text)
 
 
 def _print_attr_counts(entries: List[Dict[str, Any]], label: str) -> None:
@@ -346,7 +434,13 @@ def main() -> None:
     _print_attr_counts(entries, "Train")
     _print_attr_counts(eval_entries, "Eval")
 
-    length_fn = _build_length_fn(args.tokenizer_path.strip()) if args.tokenizer_path else None
+    tokenizer = _build_tokenizer(args.tokenizer_path.strip())
+    completion_length_provider = _build_completion_length_provider(tokenizer)
+    prompt_length_provider = _build_prompt_length_provider(tokenizer)
+    # Pretokenize once to avoid per-call tokenization cost
+    completion_length_provider.pretokenize(entries + eval_entries)
+    prompt_length_provider.pretokenize(eval_entries)
+    length_fn = completion_length_provider
 
     reordered, metrics = build_training_epochs(
         entries,
@@ -358,13 +452,11 @@ def main() -> None:
     )
 
     def _length_key(entry: Dict[str, Any]) -> int:
-        prompt = entry.get("prompt", "") or ""
-        if length_fn:
-            try:
-                return length_fn(entry)
-            except Exception:
-                pass
-        return len(prompt)
+        try:
+            return prompt_length_provider(entry)
+        except Exception:
+            prompt_text = entry.get("prompt", "") or ""
+            return len(prompt_text)
 
     eval_sorted = sorted(eval_entries, key=_length_key)
 
