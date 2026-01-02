@@ -24,7 +24,7 @@ CLI options:
                               exclude entries from training.
     --train_file_name NAME    Output filename for the Stage 2 train split (default: train_high.jsonl).
     --eval_file_name NAME     Output filename for the Stage 2 eval split (default: eval.jsonl).
-    --eval_correct_pct PCT    Target percent of per-attr eval entries that are correct (default: 25).
+    --eval_correct_pct PCT    Target percent correct within no_change and non-no_change groups (default: 25).
     --eval_no_change_pct PCT  Target percent of per-attr eval entries with no_change (default: 50).
 """
 
@@ -210,7 +210,7 @@ def _sample_attr_entries(
     no_change_ratio: float,
     rng: random.Random,
 ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
-    """Sample entries for a single attr respecting correct/no_change ratios."""
+    """Sample entries for a single attr with no_change and correct ratios."""
     if target_count <= 0 or not entries:
         return [], list(entries)
 
@@ -218,87 +218,78 @@ def _sample_attr_entries(
     rng.shuffle(pool)
 
     no_change_entries = [e for e in pool if has_no_change_flag(e)]
-    correct_entries = [e for e in pool if not is_flip(e) and e not in no_change_entries]
-    flip_entries = [e for e in pool if is_flip(e)]
+    non_no_change_entries = [e for e in pool if not has_no_change_flag(e)]
 
     target_no_change = min(len(no_change_entries), round(target_count * no_change_ratio))
-    target_correct_total = min(
-        len(no_change_entries) + len(correct_entries),
-        round(target_count * correct_ratio),
-    )
+    target_non_no_change = target_count - target_no_change
+    if target_non_no_change > len(non_no_change_entries):
+        short = target_non_no_change - len(non_no_change_entries)
+        target_non_no_change = len(non_no_change_entries)
+        target_no_change = min(len(no_change_entries), target_no_change + short)
 
-    selected: List[Dict[str, Any]] = []
+    def _sample_subset(
+        subset: List[Dict[str, Any]],
+        subset_target: int,
+    ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+        if subset_target <= 0 or not subset:
+            return [], list(subset)
 
-    # Step 1: take no_change toward its own target (counts as correct too)
-    take_nc = min(target_no_change, len(no_change_entries))
-    selected_no_change = no_change_entries[:take_nc]
-    selected.extend(selected_no_change)
+        subset_pool = list(subset)
+        rng.shuffle(subset_pool)
+        correct_entries = [e for e in subset_pool if not is_flip(e)]
+        flip_entries = [e for e in subset_pool if is_flip(e)]
 
-    correct_so_far = len(selected_no_change)
-    nc_left = no_change_entries[take_nc:]
+        target_correct = min(len(correct_entries), round(subset_target * correct_ratio))
+        selected: List[Dict[str, Any]] = []
 
-    # Step 2: take non-no_change corrects to reach correct target
-    needed_correct = max(0, target_correct_total - correct_so_far)
-    take_correct = min(needed_correct, len(correct_entries))
-    selected_correct = correct_entries[:take_correct]
-    selected.extend(selected_correct)
+        selected_correct = correct_entries[:target_correct]
+        selected.extend(selected_correct)
 
-    correct_so_far += len(selected_correct)
-    correct_left = correct_entries[take_correct:]
-    flip_left = flip_entries
+        remaining_slots = subset_target - len(selected)
+        take_flips = min(remaining_slots, len(flip_entries))
+        selected.extend(flip_entries[:take_flips])
+        remaining_slots -= take_flips
+
+        take_more_correct = 0
+        if remaining_slots > 0:
+            take_more_correct = min(remaining_slots, len(correct_entries) - len(selected_correct))
+            if take_more_correct > 0:
+                start = len(selected_correct)
+                selected.extend(correct_entries[start:start + take_more_correct])
+                remaining_slots -= take_more_correct
+
+        leftover_pool = (
+            correct_entries[len(selected_correct) + take_more_correct:]
+            + flip_entries[take_flips:]
+        )
+        return selected, leftover_pool
+
+    selected_no_change, leftover_nc = _sample_subset(no_change_entries, target_no_change)
+    selected_non_no_change, leftover_non = _sample_subset(non_no_change_entries, target_non_no_change)
+
+    selected = selected_no_change + selected_non_no_change
 
     remaining_slots = target_count - len(selected)
-    nc_short = max(0, target_no_change - len(selected_no_change))
-    needed_correct = max(0, target_correct_total - correct_so_far)
-
-    # Step 3: top up no_change if we are short and have slots
-    if remaining_slots > 0 and nc_short > 0 and nc_left:
-        take_more_nc = min(remaining_slots, nc_short, len(nc_left))
-        selected.extend(nc_left[:take_more_nc])
-        nc_left = nc_left[take_more_nc:]
-        remaining_slots -= take_more_nc
-        nc_short -= take_more_nc
-        correct_so_far += take_more_nc  # no_change counts as correct
-        needed_correct = max(0, target_correct_total - correct_so_far)
-
-    # Step 4: satisfy any remaining correct requirement (prefer non-no_change corrects, then no_change)
-    if remaining_slots > 0 and needed_correct > 0:
-        take_more_correct = min(remaining_slots, needed_correct, len(correct_left))
-        selected.extend(correct_left[:take_more_correct])
-        correct_left = correct_left[take_more_correct:]
-        remaining_slots -= take_more_correct
-        correct_so_far += take_more_correct
-        needed_correct = max(0, target_correct_total - correct_so_far)
-
-    if remaining_slots > 0 and needed_correct > 0 and nc_left:
-        take_more_nc_for_correct = min(remaining_slots, needed_correct, len(nc_left))
-        selected.extend(nc_left[:take_more_nc_for_correct])
-        nc_left = nc_left[take_more_nc_for_correct:]
-        remaining_slots -= take_more_nc_for_correct
-        correct_so_far += take_more_nc_for_correct
-        needed_correct = max(0, target_correct_total - correct_so_far)
-
-    # Step 5: fill remaining slots preferring flips, then corrects, then no_change
     if remaining_slots > 0:
-        take_flips = flip_left[:remaining_slots]
-        selected.extend(take_flips)
-        flip_left = flip_left[len(take_flips):]
-        remaining_slots -= len(take_flips)
+        if len(selected_no_change) < target_no_change and leftover_nc:
+            take_nc = min(remaining_slots, target_no_change - len(selected_no_change), len(leftover_nc))
+            selected.extend(leftover_nc[:take_nc])
+            leftover_nc = leftover_nc[take_nc:]
+            remaining_slots -= take_nc
 
-    if remaining_slots > 0:
-        take_more_correct = correct_left[:remaining_slots]
-        selected.extend(take_more_correct)
-        correct_left = correct_left[len(take_more_correct):]
-        remaining_slots -= len(take_more_correct)
+        if remaining_slots > 0 and leftover_non:
+            take_non = min(remaining_slots, len(leftover_non))
+            selected.extend(leftover_non[:take_non])
+            leftover_non = leftover_non[take_non:]
+            remaining_slots -= take_non
 
-    if remaining_slots > 0:
-        take_more_nc = nc_left[:remaining_slots]
-        selected.extend(take_more_nc)
-        nc_left = nc_left[len(take_more_nc):]
-        remaining_slots -= len(take_more_nc)
+        if remaining_slots > 0 and leftover_nc:
+            take_nc = min(remaining_slots, len(leftover_nc))
+            selected.extend(leftover_nc[:take_nc])
+            leftover_nc = leftover_nc[take_nc:]
+            remaining_slots -= take_nc
 
-    leftover_pool = nc_left + correct_left + flip_left
-
+    leftover_pool = leftover_nc + leftover_non
     return selected, leftover_pool
 
 
@@ -389,26 +380,52 @@ def print_eval_attr_stats(
         print("[INFO] Eval set is empty")
         return
 
-    attr_stats: Dict[str, Dict[str, int]] = defaultdict(lambda: {"total": 0, "correct": 0, "no_change": 0})
+    attr_stats: Dict[str, Dict[str, int]] = defaultdict(
+        lambda: {
+            "total": 0,
+            "correct": 0,
+            "no_change": 0,
+            "nc_total": 0,
+            "nc_correct": 0,
+            "non_nc_total": 0,
+            "non_nc_correct": 0,
+        }
+    )
     for entry in eval_entries:
         attr = get_target_attr(entry)
         stats = attr_stats[attr]
         stats["total"] += 1
-        if not is_flip(entry):
+        is_correct = not is_flip(entry)
+        is_no_change = has_no_change_flag(entry)
+        if is_correct:
             stats["correct"] += 1
-        if has_no_change_flag(entry):
+        if is_no_change:
             stats["no_change"] += 1
+            stats["nc_total"] += 1
+            if is_correct:
+                stats["nc_correct"] += 1
+        else:
+            stats["non_nc_total"] += 1
+            if is_correct:
+                stats["non_nc_correct"] += 1
 
     print(
-        f"Eval attr targets: correct~{correct_pct_target:.1f}%, no_change~{no_change_pct_target:.1f}%"
+        f"Eval attr targets: correct~{correct_pct_target:.1f}% (within no_change and non_no_change), "
+        f"no_change~{no_change_pct_target:.1f}%"
     )
     for attr, stats in sorted(attr_stats.items(), key=lambda kv: kv[1]["total"], reverse=True):
         tot = stats["total"]
         correct_pct = (stats["correct"] / tot) * 100.0 if tot else 0.0
         no_change_pct = (stats["no_change"] / tot) * 100.0 if tot else 0.0
+        nc_correct_pct = (stats["nc_correct"] / stats["nc_total"]) * 100.0 if stats["nc_total"] else 0.0
+        non_nc_correct_pct = (
+            (stats["non_nc_correct"] / stats["non_nc_total"]) * 100.0 if stats["non_nc_total"] else 0.0
+        )
         share_pct = (tot / total) * 100.0
         print(
-            f"  {attr}: n={tot}, correct={correct_pct:.1f}%, no_change={no_change_pct:.1f}%, share={share_pct:.1f}%"
+            f"  {attr}: n={tot}, correct={correct_pct:.1f}%, no_change={no_change_pct:.1f}%, "
+            f"correct_nc={nc_correct_pct:.1f}%, correct_non_nc={non_nc_correct_pct:.1f}%, "
+            f"share={share_pct:.1f}%"
         )
 
 
@@ -763,7 +780,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--eval_correct_pct", type=float, default=25.0,
-        help="Target percent of per-attr eval entries that are correct predictions",
+        help="Target percent correct within no_change and non-no_change groups",
     )
     parser.add_argument(
         "--eval_no_change_pct", type=float, default=50.0,
@@ -904,7 +921,7 @@ def main():
     print(f"No-change entries in eval: {count_no_change(eval_data)}")
     print_eval_attr_stats(eval_data, eval_correct_pct, eval_no_change_pct)
 
-    synth_train = synth_train * 2
+    synth_train = synth_train
 
     # Write Stage3 outputs if requested
     if args.with_stage3:

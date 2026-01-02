@@ -23,7 +23,7 @@ if os.name == 'nt':
 # --- Tokenizer setup ---
 try:
     from transformers import AutoTokenizer
-    TOKENIZER_PATH = r"I:\StatSuite\Artifacts\g2b-stage0"
+    TOKENIZER_PATH = r"I:\StatSuite\DockerWorkspace\artifacts\qwen0.6b-stage0"
     tokenizer = AutoTokenizer.from_pretrained(TOKENIZER_PATH)
 except Exception as e:
     tokenizer = None
