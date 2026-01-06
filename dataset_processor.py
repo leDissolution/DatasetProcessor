@@ -15,6 +15,31 @@ from processing_cache import (
 )
 from Entities.registry import default_registry
 
+def _write_jsonl(path: str, entries: Sequence[Dict[str, Any]], buffer_bytes: int = 1024 * 1024) -> None:
+    if not entries:
+        with open(path, "wb") as out:
+            return
+    with open(path, "wb", buffering=buffer_bytes) as out:
+        buf: List[bytes] = []
+        size = 0
+        first = True
+        for entry in entries:
+            line = orjson.dumps(entry)
+            if first:
+                buf.append(line)
+                size += len(line)
+                first = False
+            else:
+                buf.append(b"\n")
+                buf.append(line)
+                size += len(line) + 1
+            if size >= buffer_bytes:
+                out.write(b"".join(buf))
+                buf.clear()
+                size = 0
+        if buf:
+            out.write(b"".join(buf))
+
 def ingest_entities(
     path: str,
     new_path: str,
@@ -108,9 +133,7 @@ def ingest_entities(
             pass
         if len(cached_file) > 0:
             try:
-                with open(new_path, "w", encoding='utf-8') as out:
-                    lines = [orjson.dumps(entry) for entry in cached_file]
-                    out.write('\n'.join([line.decode('utf-8') for line in lines]))
+                _write_jsonl(new_path, cached_file)
             except Exception as e:
                 print(f"Error writing output file {new_path} from cache: {e}")
             finally:
@@ -302,23 +325,21 @@ def ingest_entities(
     except Exception:
         pass
     try:
-        with open(new_path, "w", encoding='utf-8') as out:
-            lines = [orjson.dumps(entry) for entry in all_entries]
-            out.write('\n'.join([line.decode('utf-8') for line in lines]))
-            if cache_write:
-                all_loss_failed = bool(with_loss and total_outs > 0 and total_success == 0)
-                should_write_file_cache = len(all_entries) > 0 and not all_loss_failed
-                if not should_write_file_cache:
-                    try:
-                        reason = "all loss failed" if all_loss_failed else "empty entries"
-                        print(f"[CACHE] Skipping file cache write for '{path}' due to {reason}.")
-                    except Exception:
-                        pass
-                else:
-                    try:
-                        cache.set_file(file_key, file_hash, version, all_entries)
-                    except Exception:
-                        pass
+        _write_jsonl(new_path, all_entries)
+        if cache_write:
+            all_loss_failed = bool(with_loss and total_outs > 0 and total_success == 0)
+            should_write_file_cache = len(all_entries) > 0 and not all_loss_failed
+            if not should_write_file_cache:
+                try:
+                    reason = "all loss failed" if all_loss_failed else "empty entries"
+                    print(f"[CACHE] Skipping file cache write for '{path}' due to {reason}.")
+                except Exception:
+                    pass
+            else:
+                try:
+                    cache.set_file(file_key, file_hash, version, all_entries)
+                except Exception:
+                    pass
     except Exception as e:
         print(f"Error writing output file {new_path}: {e}")
         return
